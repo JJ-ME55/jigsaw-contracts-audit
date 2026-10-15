@@ -39,7 +39,7 @@ contract JIGLaunch {
     address public immutable launcher;
     address public immutable potVault;
     address public immutable platform;
-    uint16 public constant TEAM_BPS = 3333; // a third of collected fees to the team, two thirds to the pot
+    uint16 public constant TEAM_BPS = 5000; // half of collected fees to the team, half to the pot (Jj, 15 Oct)
 
     IERC20 public jig;
     PoolKey public poolKey;

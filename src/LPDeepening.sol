@@ -39,7 +39,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     IAllowanceTransfer public immutable permit2;
     address public immutable pot;
     address public immutable platform;
-    uint16 public constant TEAM_BPS = 3333;
+    uint16 public constant TEAM_BPS = 5000;
     PoolKey public jigPool; // ETH / JIG
 
     address public immutable keeper;

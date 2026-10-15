@@ -105,8 +105,8 @@ contract JIGLaunchForkTest is Test {
         launch.collectFees();
         uint256 feeEth = address(pot).balance - potBefore + platform.balance - teamBefore;
         assertApproxEqRel(feeEth, 0.015 ether, 0.01e18, "1.5% of 1 ETH collected");
-        assertApproxEqRel(platform.balance - teamBefore, feeEth / 3, 0.01e18, "a third to the team");
-        assertApproxEqRel(address(pot).balance - potBefore, feeEth * 2 / 3, 0.01e18, "two thirds to the pot");
+        assertApproxEqRel(platform.balance - teamBefore, feeEth / 2, 0.01e18, "half to the team");
+        assertApproxEqRel(address(pot).balance - potBefore, feeEth / 2, 0.01e18, "half to the pot");
         assertEq(IERC721(POSM).ownerOf(launch.tokenId()), address(launch), "position still locked");
     }
 
