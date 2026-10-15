@@ -142,7 +142,7 @@ contract CreatorCoinForkTest is Test {
     function test_buy_during_snipe_window_pays_60pct_then_decays() public {
         _launch(10_000);
         PoolId id = key.toId();
-        (,,,,, uint64 launchedAt,,) = hook.pools(id);
+        (,,,,,, uint64 launchedAt,,) = hook.pools(id);
         assertEq(hook.currentFee(id), 600_000);
         vm.warp(launchedAt + 5 seconds);
         assertApproxEqAbs(hook.currentFee(id), 305_000, 1000);
@@ -227,7 +227,8 @@ contract CreatorCoinForkTest is Test {
         vm.warp(block.timestamp + 7 days + 1);
         uint256 stale = hook.claimable(creator);
         hook.recycle(key, creator);
-        assertApproxEqAbs(hook.claimable(creator), stale * 7000 / 10_000, 8, "creator keeps its slice of the recycled amount");
+        assertEq(hook.claimable(creator), 0, "the creator who let it go stale gets nothing back");
+        assertApproxEqAbs(hook.claimable(flywheel), stale * 7000 / 10_000, 8, "the block goes to the flywheel");
         assertGt(hook.claimable(platform), total * 2500 / 10_000, "platform grew from the recycle");
         assertEq(hook.totalClaimable(), total, "nothing created or lost");
     }
@@ -254,7 +255,7 @@ contract CreatorCoinForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

@@ -124,7 +124,7 @@ contract RegressionsForkTest is Test {
     function test_buyback_is_keeper_only_with_min_out() public {
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
         vm.warp(block.timestamp + 10 seconds);
-        BuybackAndBurn bb = new BuybackAndBurn(address(hook), key, platform);
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), address(factory), address(nft), platform);
         vm.prank(buyer);
         jig.transfer(address(bb), 20_000e18);
         vm.prank(buyer);
@@ -226,7 +226,7 @@ contract RegressionsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // creator allocation + dev buy + settable fee
@@ -251,8 +251,8 @@ contract RegressionsForkTest is Test {
         CreatorCoin coin = CreatorCoin(c);
         assertGt(coin.balanceOf(creator), 30_000_000e18, "3% plus the dev buy");
         assertEq(jig.balanceOf(creator), 0, "dev buy JIG spent");
-        // the dev buy paid the 60% snipe fee into the hook
-        assertGt(hook.totalClaimable(), 0);
+        // the dev buy pays the chosen fee, not the 60% snipe fee: about 1% of 50k JIG
+        assertApproxEqRel(hook.totalClaimable(), 500e18, 0.2e18, "dev buy charged ~1%, not 60%");
         // settable launch fee
         vm.prank(buyer);
         vm.expectRevert(CoinFactory.NotPlatform.selector);
@@ -260,11 +260,66 @@ contract RegressionsForkTest is Test {
         vm.prank(platform);
         factory.setLaunchFee(0.02 ether);
         assertEq(factory.launchFeeWei(), 0.02 ether);
-        // too much creator allocation refused
+        // too much creator allocation refused (checked before anything else)
         p.creatorBps = 501; p.devBuyJig = 0;
         vm.prank(creator);
-        vm.expectRevert(CoinFactory.CollectionHasCoin.selector); // same collection; the share check comes after
+        vm.expectRevert(CoinFactory.TooMuchCreator.selector);
         factory.launch{value: 0.02 ether}(p);
+    }
+
+    // HIGH (third pass): recycling is per pool and never pays the party that went stale
+    function test_recycle_cannot_touch_balances_earned_elsewhere() public {
+        // victim earns on their own coin
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        uint256 victimBal = hook.claimable(creator);
+        assertGt(victimBal, 0);
+        // attacker launches a junk coin naming the victim as its flywheel
+        OwnedNFT junk = new OwnedNFT(squatter);
+        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        bool c0 = predicted < address(jig);
+        uint256 price = c0 ? 1e18 / 1000 : 1000 * 1e18;
+        uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
+        int24 st = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lo; int24 hi;
+        if (c0) { lo = (st / 200 + 1) * 200; hi = 887_200; } else { lo = -887_200; hi = (st / 200 - 1) * 200; }
+        CoinFactory.LaunchParams memory p = _params(address(junk), 10_000, creator, sqrtP, lo, hi);
+        vm.prank(squatter);
+        (, address junkCoin) = factory.launch{value: 0.01 ether}(p);
+        PoolKey memory junkKey = factory.keyOf(address(junk));
+        vm.prank(squatter);
+        hook.setCreatorShare(junkKey, 7000);
+        vm.warp(block.timestamp + 8 days);
+        // the victim earned nothing on the junk pool, so there is nothing to recycle there
+        vm.expectRevert(CreatorFeeHook.NotStale.selector);
+        hook.recycle(junkKey, creator);
+        assertEq(hook.claimable(creator), victimBal, "victim untouched");
+        junkCoin;
+        // protocol addresses cannot be named as a flywheel at all
+        OwnedNFT junk2 = new OwnedNFT(squatter);
+        p.collection = address(junk2); p.flywheel = platform;
+        vm.prank(squatter);
+        vm.expectRevert(CreatorFeeHook.BadFlywheel.selector);
+        factory.launch{value: 0.01 ether}(p);
+    }
+
+    // MEDIUM (third pass): a stale flywheel balance goes to the pot, never to the creator
+    function test_stale_flywheel_balance_feeds_the_pot_not_the_creator() public {
+        HolderDrip drip = new HolderDrip(address(hook), address(nft));
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        uint256 dripBal = hook.claimable(address(drip));
+        vm.prank(creator);
+        hook.setCreatorShare(key, 7000);
+        uint256 creatorBefore = hook.claimable(creator);
+        uint256 potBefore = hook.claimable(address(pot));
+        vm.warp(block.timestamp + 8 days);
+        hook.recycle(key, address(drip));
+        assertEq(hook.claimable(creator), creatorBefore, "creator gains nothing");
+        assertGt(hook.claimable(address(pot)) - potBefore, dripBal * 6000 / 10_000, "the block went to the pot");
+        assertEq(hook.claimable(address(drip)), 0);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

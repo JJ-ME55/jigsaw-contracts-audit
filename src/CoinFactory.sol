@@ -58,7 +58,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         string symbol;
         uint24 feePips; // 10_000 (1%) .. 100_000 (10%) in steps of 10_000
         address flywheel; // module for the flywheel slice; address(0) = creator wallet
-        uint16 creatorShareBps; // creator's share of the fee within the creator+flywheel block; 0 = default (flywheel 20%)
+        uint16 creatorShareBps; // creator's share of the fee within the creator+flywheel block; type(uint16).max = default (flywheel 20%), 0 = everything to the flywheel
         uint16 creatorBps; // share of supply to the creator's wallet at launch, 0..500 (0..5%)
         uint256 devBuyJig; // JIG the creator spends buying the coin in this transaction, 0 for none (needs approval)
         uint256 devBuyMinCoin; // slippage floor for the dev buy
@@ -69,6 +69,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
     Launch[] public launches;
     mapping(address collection => address coin) public coinOf;
+    mapping(address collection => PoolKey) private _keyOf;
 
     event CoinLaunched(uint256 indexed index, address indexed coin, address indexed collection, address creator, uint24 feePips, address flywheel, uint256 tokenId, uint256 creatorTokens, uint256 devBuyJig, uint256 devBuyCoin);
     event LaunchFeeSet(uint256 launchFeeWei);
@@ -107,9 +108,9 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     function launch(LaunchParams calldata p) external payable nonReentrant returns (uint256 index, address coinAddr) {
         if (msg.value != launchFeeWei) revert WrongFee();
         if (p.collection == address(0) || p.collection.code.length == 0) revert ZeroAddress();
+        if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
         if (coinOf[p.collection] != address(0)) revert CollectionHasCoin();
         if (!_controlsCollection(msg.sender, p.collection)) revert NotCollectionOwner();
-        if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
 
         CreatorCoin coin = new CreatorCoin(p.name, p.symbol, SUPPLY, p.collection, address(this));
         coinAddr = address(coin);
@@ -128,6 +129,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         if (p.tickLower >= p.tickUpper) revert RangeWrongSide();
         if (coinIs0 ? p.tickLower <= startTick : p.tickUpper > startTick) revert RangeWrongSide();
 
+        _keyOf[p.collection] = key;
         hook.register(key, msg.sender, p.flywheel, p.feePips, p.creatorShareBps);
         if (posm.initializePool(key, p.sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
 
@@ -211,6 +213,11 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
     function poolKeyOf(uint256 index) external view returns (PoolKey memory) {
         return launches[index].key;
+    }
+
+    /// @notice The pool key of a collection's coin (zero key if none launched).
+    function keyOf(address collection) external view returns (PoolKey memory) {
+        return _keyOf[collection];
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

@@ -220,7 +220,8 @@ contract FlywheelsForkTest is Test {
         // deploy the module and lower nothing; instead test the module on a second coin launched with it.
         // Simplest: predict nothing, launch with a placeholder, then launch again with the real module.
         (, PoolKey memory k0, bool c0) = _launchCoin(address(0));
-        BuybackAndBurn bb = new BuybackAndBurn(address(hook), k0, platform);
+        k0;
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), address(factory), address(nft), platform);
         // the flywheel for coin 0 was the creator (address(0) => creator). Give the module JIG directly instead.
         _buyCoin(k0, c0, 100_000e18);
         uint256 creatorSlice = hook.claimable(creator);
@@ -275,18 +276,18 @@ contract FlywheelsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // ---------- SnapshotForwarder + HolderPayouts ----------
 
     function test_snapshot_payouts_round_trip() public {
         HolderPayouts payouts = new HolderPayouts(platform, address(jig));
-        // the forwarder needs the coin address, which the factory creates: predict it
-        address predictedCoin = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
-        SnapshotForwarder fwd = new SnapshotForwarder(address(hook), address(payouts), predictedCoin);
+        SnapshotForwarder fwd = new SnapshotForwarder(address(hook), address(payouts), address(factory), address(nft));
+        vm.expectRevert(SnapshotForwarder.NoCoinYet.selector);
+        fwd.coin();
         (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(address(fwd));
-        assertEq(address(coin), predictedCoin);
+        assertEq(fwd.coin(), address(coin));
         _buyCoin(key, coinIs0, 100_000e18);
         uint256 slice = hook.claimable(address(fwd));
         assertGt(slice, 0);
