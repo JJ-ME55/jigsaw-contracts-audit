@@ -65,6 +65,8 @@ Reads `LAUNCH_PK` (deployer and launcher) and optional `POT_OWNER`. Refuses chai
 
 ## Audit status
 
+**Founders' decision, 15 Oct 2026 (Jj):** for now the only audits are IMD swarm audits. Each contract gets one at write time and one more after the full set is frozen. The external audit is deferred, not cancelled; the scope document is kept current so it can go out the day the decision changes. The fee hook and factory carry every coin's money, so this is the main open risk on the project.
+
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
 | JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook | Claude, 15 Oct, with 25 passing tests (14 unit, 11 on a Sepolia fork) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
