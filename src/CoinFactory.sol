@@ -87,7 +87,6 @@ contract CoinFactory is ReentrancyGuard {
 
     /// @param feePips creator-chosen fee, 10_000 (1%) to 100_000 (10%) in steps of 10_000
     /// @param flywheel module that receives the flywheel slice, address(0) = creator
-    /// @param launchReferral site that launched the coin, address(0) = platform
     /// @param sqrtPriceX96 start price as sqrt(currency1 per currency0) * 2^96, computed off chain for the pair's ordering
     /// @param tickLower,tickUpper the seeded range, single-sided on the coin: entirely below the price if the coin is currency1,
     ///        entirely above it if the coin is currency0
@@ -97,7 +96,6 @@ contract CoinFactory is ReentrancyGuard {
         string calldata symbol,
         uint24 feePips,
         address flywheel,
-        address launchReferral,
         uint160 sqrtPriceX96,
         int24 tickLower,
         int24 tickUpper
@@ -124,7 +122,7 @@ contract CoinFactory is ReentrancyGuard {
         if (tickLower >= tickUpper) revert RangeWrongSide();
         if (coinIs0 ? tickLower <= startTick : tickUpper > startTick) revert RangeWrongSide();
 
-        hook.register(key, msg.sender, flywheel, launchReferral, feePips);
+        hook.register(key, msg.sender, flywheel, feePips);
         if (posm.initializePool(key, sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
 
         uint128 liquidity = coinIs0

@@ -31,7 +31,7 @@ contract DeployDeepening is Script {
         });
 
         vm.startBroadcast(pk);
-        LPDeepening deep = new LPDeepening(hook, posm, permit2, jigPool, vm.envOr("MAX_PER_RUN", uint256(5_000_000e18)));
+        LPDeepening deep = new LPDeepening(hook, posm, permit2, jigPool, vm.envOr("KEEPER", vm.addr(pk)));
         CreatorFeeHook(hook).setDeepening(address(deep));
         vm.stopBroadcast();
 

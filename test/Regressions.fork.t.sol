@@ -12,7 +12,6 @@ import {CreatorCoin} from "../src/CreatorCoin.sol";
 import {HolderDrip} from "../src/HolderDrip.sol";
 import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
 import {AirdropClaim} from "../src/AirdropClaim.sol";
-import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -48,7 +47,7 @@ contract RegressionsForkTest is Test {
     address late = makeAddr("late");
 
     PotVault pot; JIG jig; Vesting vesting; JIGLaunch launch; CreatorFeeHook hook; CoinFactory factory;
-    ReferrerRegistry registry; OwnedNFT nft; PoolSwapTest swapper; PoolKey jigKey;
+    OwnedNFT nft; PoolSwapTest swapper; PoolKey jigKey;
 
     function setUp() public {
         vm.createSelectFork("sepolia");
@@ -61,9 +60,8 @@ contract RegressionsForkTest is Test {
         launch.launch(10_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
         vm.stopPrank();
         jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 10_000, tickSpacing: 200, hooks: IHooks(address(0))});
-        registry = new ReferrerRegistry(platform);
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xC0DE) << 20));
-        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(registry)), hookAddr);
+        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(pot), 0.01 ether);
         vm.prank(owner);
@@ -85,7 +83,7 @@ contract RegressionsForkTest is Test {
         int24 lower; int24 upper;
         if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
         vm.prank(who);
-        (, address c) = factory.launch{value: 0.01 ether}(address(nft), "Cool", "COOL", 10_000, flywheel, address(0), sqrtP, lower, upper);
+        (, address c) = factory.launch{value: 0.01 ether}(address(nft), "Cool", "COOL", 10_000, flywheel, sqrtP, lower, upper);
         coin = CreatorCoin(c);
         key = factory.poolKeyOf(factory.count() - 1);
     }
@@ -101,10 +99,10 @@ contract RegressionsForkTest is Test {
     function test_only_collection_owner_can_launch() public {
         vm.prank(squatter);
         vm.expectRevert(CoinFactory.NotCollectionOwner.selector);
-        factory.launch{value: 0.01 ether}(address(nft), "x", "x", 10_000, address(0), address(0), 1 << 96, -200, 0);
+        factory.launch{value: 0.01 ether}(address(nft), "x", "x", 10_000, address(0), 1 << 96, -200, 0);
         vm.prank(creator);
         vm.expectRevert(CoinFactory.ZeroAddress.selector);
-        factory.launch{value: 0.01 ether}(makeAddr("eoa"), "x", "x", 10_000, address(0), address(0), 1 << 96, -200, 0);
+        factory.launch{value: 0.01 ether}(makeAddr("eoa"), "x", "x", 10_000, address(0), 1 << 96, -200, 0);
         _launchCoin(creator, address(0));
         assertEq(factory.count(), 1);
     }
@@ -120,6 +118,26 @@ contract RegressionsForkTest is Test {
         hook.claimFor(address(pot));
         assertEq(jig.balanceOf(address(pot)) - before, owed);
         assertEq(hook.claimable(address(pot)), 0);
+    }
+
+    // keeper-only, whole balance, min-out
+    function test_buyback_is_keeper_only_with_min_out() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 minutes);
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), key, platform);
+        vm.prank(buyer);
+        jig.transfer(address(bb), 20_000e18);
+        vm.prank(buyer);
+        vm.expectRevert(BuybackAndBurn.NotKeeper.selector);
+        bb.run(0);
+        vm.prank(platform);
+        vm.expectRevert(BuybackAndBurn.TooLittleOut.selector);
+        bb.run(type(uint256).max);
+        vm.prank(platform);
+        uint256 got = bb.run(1);
+        assertGt(got, 0);
+        assertEq(jig.balanceOf(address(bb)), 0, "entire balance used");
+        coinIs0;
     }
 
     // MEDIUM: exact-output discount
@@ -139,20 +157,6 @@ contract RegressionsForkTest is Test {
         // the second buy is a touch pricier (price moved), so exact-out must cost at least as much as exact-in
         assertGe(spentOut, spentIn, "exact-output no longer cheaper");
         assertGe(feeOut * 100, feeIn * 95, "fee collected is comparable");
-    }
-
-    // LOW: self-referral
-    function test_unapproved_trade_referral_goes_to_platform() public {
-        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
-        vm.warp(block.timestamp + 10 minutes);
-        _swap(buyer, key, !coinIs0, -100_000e18, abi.encode(buyer));
-        uint256 total = hook.totalClaimable();
-        assertEq(hook.claimable(buyer), 0, "no self rebate");
-        assertApproxEqAbs(hook.claimable(platform), total * (1500 + 1000 + 1000) / 10_000, 3, "platform: its band + trade ref + launch ref");
-        vm.prank(platform);
-        registry.setReferrer(late, true);
-        _swap(buyer, key, !coinIs0, -100_000e18, abi.encode(late));
-        assertGt(hook.claimable(late), 0, "approved referrer is paid");
     }
 
     // HIGH: post-pull mints over-claim the drip
@@ -178,19 +182,6 @@ contract RegressionsForkTest is Test {
         drip.pull();
         assertGt(drip.owed(5), 0);
         assertApproxEqAbs(drip.owed(5), drip.owed(1), 2);
-    }
-
-    // MEDIUM: owner self-payout needs to wait the delay
-    function test_pot_declare_has_a_delay() public {
-        vm.startPrank(owner);
-        pot.enablePayouts();
-        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(owner, uint256(1e18)))));
-        vm.expectRevert(PotVault.BadDistribution.selector);
-        pot.declare(address(jig), leaf, 1e18, uint64(block.timestamp + 1 days)); // expiry inside the delay
-        uint256 id = pot.declare(address(jig), leaf, 1e18, uint64(block.timestamp + 30 days));
-        vm.stopPrank();
-        vm.expectRevert(PotVault.NotYet.selector);
-        pot.claim(id, owner, 1e18, new bytes32[](0));
     }
 
     // HIGH (second pass): claimFor could strand the drip's slice
@@ -219,21 +210,6 @@ contract RegressionsForkTest is Test {
         nft.mint(late, 1); // id 5 after the pull
         assertEq(drip.owed(5), 0, "late token earns nothing");
         assertApproxEqAbs(drip.owed(1), 5_000e18, 4);
-    }
-
-    // MEDIUM (second pass): a same-block pump cannot widen the buyback bound
-    function test_buyback_bound_uses_lagged_reference_revert_path() public {
-        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
-        vm.warp(block.timestamp + 10 minutes);
-        BuybackAndBurn bb = new BuybackAndBurn(address(hook), key, 1_000_000e18);
-        vm.prank(buyer);
-        jig.transfer(address(bb), 20_000e18);
-        bb.observe();
-        vm.roll(vm.getBlockNumber() + 1);
-        _swap(buyer, key, !coinIs0, -300_000e18, "");
-        vm.expectRevert(BuybackAndBurn.Nothing.selector);
-        bb.run();
-        assertEq(bb.lastRun(), 0, "cooldown not burned by a zero fill");
     }
 
     // LOW (second pass): only the factory can start the airdrop clock

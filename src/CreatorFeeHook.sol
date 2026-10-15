@@ -15,7 +15,6 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {IReferrerRegistry} from "./ReferrerRegistry.sol";
 
 /// @title CreatorFeeHook
 /// @notice The one shared fee hook for every creator coin (Economics v3 §5, Addendum A, Build Spec §5).
@@ -23,14 +22,13 @@ import {IReferrerRegistry} from "./ReferrerRegistry.sol";
 ///   Every creator-coin pool is coin/JIG, LP fee 0, with this hook. On every swap the
 ///   hook takes the creator's chosen fee (1% to 10%, set at launch, lower-only) from the
 ///   swap's unspecified currency. If that is the coin, the hook sells it for JIG in the
-///   same transaction, so everything the hook ever holds is JIG. It then credits six
-///   claimable balances: creator, flywheel module, launch referral, trade referral,
-///   platform, JIG pot, plus the LP-deepening slice. All payouts are pull (claim()),
-///   never push.
+///   same transaction, so everything the hook ever holds is JIG. It then credits five
+///   claimable balances: creator, flywheel module, platform, JIG pot and the LP-deepening
+///   module. All payouts are pull (claim() / claimFor()), never push.
 ///
-///   Fee split, in basis points of the fee: flywheel 2000, launch referral 1000, trade
-///   referral 1000, pot 300, deepening 200, platform by band (1% -> 1500, 2-3% -> 2000,
-///   4-6% -> 2500, 7-10% -> 3000), creator the remainder. Referrals default to platform.
+///   Fee split, in basis points of the fee: flywheel 2000, pot 300, deepening 200,
+///   platform by band (1% -> 3500, 2-3% -> 4000, 4-6% -> 4500, 7-10% -> 5000), creator the
+///   remainder (40% / 35% / 30% / 25%).
 ///
 ///   Anti-snipe: for SNIPE_WINDOW after launch the fee decays linearly from SNIPE_FEE
 ///   (60%) down to the chosen fee.
@@ -46,7 +44,6 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         address coin;
         address creator;
         address flywheel; // module that receives the flywheel slice; address(0) = creator
-        address launchReferral; // address(0) = platform
         uint24 feePips; // 10_000 (1%) .. 100_000 (10%)
         uint64 launchedAt;
         bool coinIs0;
@@ -60,8 +57,6 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     uint256 internal constant PIPS = 1_000_000;
 
     uint16 public constant FLYWHEEL_BPS = 2000;
-    uint16 public constant LAUNCH_REF_BPS = 1000;
-    uint16 public constant TRADE_REF_BPS = 1000;
     uint16 public constant POT_BPS = 300;
     uint16 public constant DEEPEN_BPS = 200;
 
@@ -72,7 +67,6 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     address public immutable platform;
     address public immutable pot;
     address public deepening; // LP-deepening module; the pot until setDeepening() binds it (once)
-    IReferrerRegistry public immutable referrers; // approved trade-referral recipients; unapproved => platform
 
     mapping(PoolId => Config) public pools;
     mapping(address => uint256) public claimable; // JIG owed, by recipient
@@ -80,11 +74,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     uint256 public totalClaimable;
     bool private _converting;
 
-    event PoolRegistered(PoolId indexed id, address indexed coin, address indexed creator, uint24 feePips, address flywheel, address launchReferral);
+    event PoolRegistered(PoolId indexed id, address indexed coin, address indexed creator, uint24 feePips, address flywheel);
     event FeeLowered(PoolId indexed id, uint24 feePips);
     event FactorySet_(address factory);
     event DeepeningSet_(address deepening);
-    event FeeTaken(PoolId indexed id, address indexed tradeReferral, uint256 jigAmount, uint24 feePips);
+    event FeeTaken(PoolId indexed id, uint256 jigAmount, uint24 feePips);
     event Claimed(address indexed to, uint256 amount);
 
     error NotPoolManager();
@@ -99,9 +93,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error BadFee();
     error HookNotImplemented();
 
-    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_, address referrers_) {
-        if (referrers_ == address(0) || referrers_.code.length == 0) revert BadPool();
-        referrers = IReferrerRegistry(referrers_);
+    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
         poolManager = IPoolManager(poolManager_);
         jig = IERC20(jig_);
         owner = owner_;
@@ -149,7 +141,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Called by the factory before it initialises the pool.
-    function register(PoolKey calldata key, address creator, address flywheel, address launchReferral, uint24 feePips) external {
+    function register(PoolKey calldata key, address creator, address flywheel, uint24 feePips) external {
         if (msg.sender != factory) revert NotFactory();
         if (feePips < MIN_FEE || feePips > MAX_FEE || feePips % MIN_FEE != 0) revert BadFee();
         if (address(key.hooks) != address(this) || key.fee != 0) revert BadPool();
@@ -165,13 +157,12 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
             coin: coinIs0 ? c0 : c1,
             creator: creator,
             flywheel: flywheel,
-            launchReferral: launchReferral,
             feePips: feePips,
             launchedAt: uint64(block.timestamp),
             coinIs0: coinIs0,
             registered: true
         });
-        emit PoolRegistered(id, coinIs0 ? c0 : c1, creator, feePips, flywheel, launchReferral);
+        emit PoolRegistered(id, coinIs0 ? c0 : c1, creator, feePips, flywheel);
     }
 
     /// @notice The creator may lower the fee, never raise it.
@@ -194,10 +185,10 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     function platformBps(uint24 feePips) public pure returns (uint16) {
-        if (feePips <= 10_000) return 1500;
-        if (feePips <= 30_000) return 2000;
-        if (feePips <= 60_000) return 2500;
-        return 3000;
+        if (feePips <= 10_000) return 3500;
+        if (feePips <= 30_000) return 4000;
+        if (feePips <= 60_000) return 4500;
+        return 5000;
     }
 
     // ---------------- claims ----------------
@@ -273,10 +264,9 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         bool feeIsCoin = Currency.unwrap(feeCurrency) == c.coin;
         if (feeIsCoin) jigAmount = _sellCoinForJig(key, id, c.coinIs0, fee);
 
-        address tradeRef = hookData.length >= 32 ? abi.decode(hookData, (address)) : address(0);
-        if (tradeRef != address(0) && !referrers.isReferrer(tradeRef)) tradeRef = address(0);
-        _split(c, jigAmount, tradeRef);
-        emit FeeTaken(id, tradeRef, jigAmount, feePips);
+        hookData;
+        _split(c, jigAmount);
+        emit FeeTaken(id, jigAmount, feePips);
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
 
@@ -307,18 +297,14 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         pendingCoin[id] = amount - owed;
     }
 
-    function _split(Config storage c, uint256 amount, address tradeRef) internal {
+    function _split(Config storage c, uint256 amount) internal {
         uint256 fly = (amount * FLYWHEEL_BPS) / 10_000;
-        uint256 lref = (amount * LAUNCH_REF_BPS) / 10_000;
-        uint256 tref = (amount * TRADE_REF_BPS) / 10_000;
         uint256 potA = (amount * POT_BPS) / 10_000;
         uint256 deep = (amount * DEEPEN_BPS) / 10_000;
         uint256 plat = (amount * platformBps(c.feePips)) / 10_000;
-        uint256 creator = amount - fly - lref - tref - potA - deep - plat;
+        uint256 creator = amount - fly - potA - deep - plat;
 
         _credit(c.flywheel == address(0) ? c.creator : c.flywheel, fly);
-        _credit(c.launchReferral == address(0) ? platform : c.launchReferral, lref);
-        _credit(tradeRef == address(0) ? platform : tradeRef, tref);
         _credit(pot, potA);
         _credit(deepening, deep);
         _credit(platform, plat);

@@ -12,7 +12,7 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///         NFT holders (Build Spec §4). CoinFactory sends each coin's 5% here at launch.
 ///         The owner (platform) then sets one root per coin from a holder snapshot, with
 ///         a claim window. Leftovers after the window go to the pot, as does a share whose drop
-///         is never set within 180 days. The owner chooses recipients through the root but has
+///         is never set within 7 days. The owner chooses recipients through the root but has
 ///         no withdraw path: tokens only ever go to proven leaves or to the pot.
 contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -22,14 +22,11 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
         uint128 total;
         uint128 claimed;
         uint64 expiry;
-        uint64 claimableFrom; // setDrop + SET_DELAY: time to check the tree against the snapshot
     }
-
-    uint64 public constant SET_DELAY = 24 hours;
 
     address public immutable pot;
     address public factory; // set once by the owner; the only caller of notify()
-    uint64 public constant UNSET_WINDOW = 180 days;
+    uint64 public constant UNSET_WINDOW = 7 days;
     mapping(address coin => Drop) public drops;
     mapping(address coin => uint64) public receivedAt; // when the factory delivered a coin's share
     mapping(address coin => mapping(address account => bool)) public hasClaimed;
@@ -49,7 +46,6 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     error NotUnset();
     error NotFactory();
     error FactorySet();
-    error NotYet();
 
     constructor(address owner_, address pot_) Ownable(owner_) {
         if (pot_ == address(0)) revert ZeroAddress();
@@ -79,16 +75,15 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     /// @notice Set a coin's drop once. `total` may not exceed what this contract holds of the coin.
     function setDrop(address coin, bytes32 root, uint256 total, uint64 expiry) external onlyOwner {
         if (drops[coin].root != bytes32(0)) revert AlreadySet();
-        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp + SET_DELAY) revert BadDrop();
+        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp) revert BadDrop();
         if (total > IERC20(coin).balanceOf(address(this))) revert BadDrop();
-        drops[coin] = Drop({root: root, total: uint128(total), claimed: 0, expiry: expiry, claimableFrom: uint64(block.timestamp) + SET_DELAY});
+        drops[coin] = Drop({root: root, total: uint128(total), claimed: 0, expiry: expiry});
         emit DropSet(coin, root, total, expiry);
     }
 
     function claim(address coin, address account, uint256 amount, bytes32[] calldata proof) external nonReentrant {
         Drop storage d = drops[coin];
         if (d.root == bytes32(0)) revert NotOpen();
-        if (block.timestamp < d.claimableFrom) revert NotYet();
         if (block.timestamp > d.expiry) revert Expired();
         if (hasClaimed[coin][account]) revert AlreadyClaimed();
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));

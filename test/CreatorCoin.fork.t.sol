@@ -8,7 +8,6 @@ import {Vesting} from "../src/Vesting.sol";
 import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
 import {CreatorCoin} from "../src/CreatorCoin.sol";
-import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
 
 contract OwnedCollection {
     address public owner;
@@ -38,8 +37,6 @@ contract CreatorCoinForkTest is Test {
     address creator = makeAddr("creator");
     address collection;
     address flywheel = makeAddr("flywheel");
-    address launchSite = makeAddr("launchSite");
-    address tradeSite = makeAddr("tradeSite");
     address buyer = makeAddr("buyer");
 
     PotVault pot;
@@ -47,7 +44,6 @@ contract CreatorCoinForkTest is Test {
     Vesting vesting;
     CreatorFeeHook hook;
     CoinFactory factory;
-    ReferrerRegistry registry;
     PoolSwapTest swapper;
     CreatorCoin coin;
     PoolKey key;
@@ -64,15 +60,10 @@ contract CreatorCoinForkTest is Test {
         vesting = new Vesting();
 
         collection = address(new OwnedCollection(creator));
-        registry = new ReferrerRegistry(platform);
-        vm.startPrank(platform);
-        registry.setReferrer(launchSite, true);
-        registry.setReferrer(tradeSite, true);
-        vm.stopPrank();
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xBEEF) << 20));
         deployCodeTo(
             "CreatorFeeHook.sol:CreatorFeeHook",
-            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(registry)),
+            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)),
             hookAddr
         );
         hook = CreatorFeeHook(hookAddr);
@@ -101,7 +92,7 @@ contract CreatorCoinForkTest is Test {
         else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
 
         vm.prank(creator);
-        (, address coinAddr) = factory.launch{value: 0.01 ether}(collection, "Cool Coin", "COOL", feePips, flywheel, launchSite, sqrtP, lower, upper);
+        (, address coinAddr) = factory.launch{value: 0.01 ether}(collection, "Cool Coin", "COOL", feePips, flywheel, sqrtP, lower, upper);
         coin = CreatorCoin(coinAddr);
         assertEq(coinAddr, predictedCoin);
         key = factory.poolKeyOf(0);
@@ -148,13 +139,13 @@ contract CreatorCoinForkTest is Test {
         assertEq(factory.coinOf(collection), address(coin));
         vm.prank(creator);
         vm.expectRevert(CoinFactory.CollectionHasCoin.selector);
-        factory.launch{value: 0.01 ether}(collection, "x", "x", 10_000, address(0), address(0), 1, 0, 1);
+        factory.launch{value: 0.01 ether}(collection, "x", "x", 10_000, address(0), 1, 0, 1);
     }
 
     function test_buy_during_snipe_window_pays_60pct_then_decays() public {
         _launch(10_000);
         PoolId id = key.toId();
-        (,,,,, uint64 launchedAt,,) = hook.pools(id);
+        (,,,, uint64 launchedAt,,) = hook.pools(id);
         assertEq(hook.currentFee(id), 600_000);
         vm.warp(launchedAt + 5 minutes);
         assertApproxEqAbs(hook.currentFee(id), 305_000, 1000);
@@ -166,18 +157,16 @@ contract CreatorCoinForkTest is Test {
         _launch(10_000);
         vm.warp(block.timestamp + 10 minutes);
         uint256 potBefore = hook.claimable(address(pot));
-        uint256 got = _buy(buyer, 1_000e18, abi.encode(tradeSite));
+        uint256 got = _buy(buyer, 1_000e18, "");
         assertGt(got, 0);
         uint256 total = hook.totalClaimable();
         assertGt(total, 0, "fee converted to JIG and credited");
         assertEq(coin.balanceOf(address(hook)), 0, "hook holds no coin");
         assertEq(hook.heldJig(), total, "hook holds exactly the claimable JIG as claims");
-        // split at 1%: flywheel 20, launch ref 10, trade ref 10, pot 3, deepening 2 (pot here), platform 15, creator 40
+        // split at 1%: flywheel 20, pot 3, deepening 2 (pot here), platform 35, creator 40
         assertEq(hook.claimable(flywheel), total * 2000 / 10_000);
-        assertEq(hook.claimable(launchSite), total * 1000 / 10_000);
-        assertEq(hook.claimable(tradeSite), total * 1000 / 10_000);
         assertApproxEqAbs(hook.claimable(address(pot)) - potBefore, total * 500 / 10_000, 2, "pot 3% + deepening 2% (pot stands in)");
-        assertEq(hook.claimable(platform), total * 1500 / 10_000);
+        assertEq(hook.claimable(platform), total * 3500 / 10_000);
         assertApproxEqAbs(hook.claimable(creator), total * 4000 / 10_000, 8, "creator gets the remainder, 40% at a 1% fee");
         // about 1% of the JIG in: buy of 1000 JIG, fee taken on the coin side then sold back, so a bit under 10 JIG
         assertApproxEqRel(total, 10e18, 0.15e18);
@@ -193,21 +182,20 @@ contract CreatorCoinForkTest is Test {
         assertApproxEqRel(fee, jigOut / 99, 0.02e18, "1% of the JIG output");
     }
 
-    function test_referrals_default_to_platform() public {
+    function test_platform_band_at_1pct() public {
         _launch(10_000);
         vm.warp(block.timestamp + 10 minutes);
-        // relaunch-free check: launchReferral was launchSite; trade referral absent -> platform gets trade slice
         _buy(buyer, 1_000e18, "");
         uint256 total = hook.totalClaimable();
-        assertApproxEqAbs(hook.claimable(platform), total * (1500 + 1000) / 10_000, 2);
+        assertApproxEqAbs(hook.claimable(platform), total * 3500 / 10_000, 2);
     }
 
     function test_band_at_5pct() public {
         _launch(50_000);
         vm.warp(block.timestamp + 10 minutes);
-        _buy(buyer, 1_000e18, abi.encode(tradeSite));
+        _buy(buyer, 1_000e18, "");
         uint256 total = hook.totalClaimable();
-        assertApproxEqAbs(hook.claimable(platform), total * 2500 / 10_000, 2, "platform 25% band at 5%");
+        assertApproxEqAbs(hook.claimable(platform), total * 4500 / 10_000, 2, "platform 45% band at 5%");
         assertApproxEqAbs(hook.claimable(creator), total * 3000 / 10_000, 8, "creator 30% at 5%");
         assertApproxEqRel(total, 50e18, 0.15e18, "about 5% of 1000 JIG");
     }
@@ -215,7 +203,7 @@ contract CreatorCoinForkTest is Test {
     function test_claim_is_pull() public {
         _launch(10_000);
         vm.warp(block.timestamp + 10 minutes);
-        _buy(buyer, 1_000e18, abi.encode(tradeSite));
+        _buy(buyer, 1_000e18, "");
         uint256 owed = hook.claimable(creator);
         vm.prank(creator);
         uint256 paid = hook.claim();
@@ -241,7 +229,7 @@ contract CreatorCoinForkTest is Test {
     function test_bad_fee_and_unregistered_pool_refused() public {
         vm.prank(creator);
         vm.expectRevert(CreatorFeeHook.BadFee.selector);
-        factory.launch{value: 0.01 ether}(collection, "x", "x", 15_000, address(0), address(0), 1 << 96, -200, 0);
+        factory.launch{value: 0.01 ether}(collection, "x", "x", 15_000, address(0), 1 << 96, -200, 0);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
