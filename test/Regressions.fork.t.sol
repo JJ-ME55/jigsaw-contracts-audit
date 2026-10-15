@@ -52,18 +52,18 @@ contract RegressionsForkTest is Test {
     function setUp() public {
         vm.createSelectFork("sepolia");
         pot = new PotVault(owner);
-        launch = new JIGLaunch(POSM, PERMIT2, owner, address(pot));
+        launch = new JIGLaunch(POSM, PERMIT2, owner, address(pot), platform);
         jig = new JIG(address(launch), address(pot));
         vesting = new Vesting();
         vm.startPrank(owner);
         launch.setJig(address(jig));
-        launch.launch(10_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
+        launch.launch(15_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
         vm.stopPrank();
-        jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 10_000, tickSpacing: 200, hooks: IHooks(address(0))});
+        jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 15_000, tickSpacing: 200, hooks: IHooks(address(0))});
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xC0DE) << 20));
         deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
-        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(pot), 0.01 ether);
+        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(pot), 0.01 ether);
         vm.prank(owner);
         hook.setFactory(address(factory));
         nft = new OwnedNFT(creator);
@@ -83,7 +83,7 @@ contract RegressionsForkTest is Test {
         int24 lower; int24 upper;
         if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
         vm.prank(who);
-        (, address c) = factory.launch{value: 0.01 ether}(address(nft), "Cool", "COOL", 10_000, flywheel, sqrtP, lower, upper);
+        (, address c) = factory.launch{value: 0.01 ether}(_params(address(nft), 10_000, flywheel, sqrtP, lower, upper));
         coin = CreatorCoin(c);
         key = factory.poolKeyOf(factory.count() - 1);
     }
@@ -99,10 +99,10 @@ contract RegressionsForkTest is Test {
     function test_only_collection_owner_can_launch() public {
         vm.prank(squatter);
         vm.expectRevert(CoinFactory.NotCollectionOwner.selector);
-        factory.launch{value: 0.01 ether}(address(nft), "x", "x", 10_000, address(0), 1 << 96, -200, 0);
+        factory.launch{value: 0.01 ether}(_params(address(nft), 10_000, address(0), 1 << 96, -200, 0));
         vm.prank(creator);
         vm.expectRevert(CoinFactory.ZeroAddress.selector);
-        factory.launch{value: 0.01 ether}(makeAddr("eoa"), "x", "x", 10_000, address(0), 1 << 96, -200, 0);
+        factory.launch{value: 0.01 ether}(_params(makeAddr("eoa"), 10_000, address(0), 1 << 96, -200, 0));
         _launchCoin(creator, address(0));
         assertEq(factory.count(), 1);
     }
@@ -110,7 +110,7 @@ contract RegressionsForkTest is Test {
     // HIGH: pot could never claim
     function test_anyone_can_push_the_pot_its_slice() public {
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
-        vm.warp(block.timestamp + 10 minutes);
+        vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -100_000e18, "");
         uint256 owed = hook.claimable(address(pot));
         assertGt(owed, 0);
@@ -123,7 +123,7 @@ contract RegressionsForkTest is Test {
     // keeper-only, whole balance, min-out
     function test_buyback_is_keeper_only_with_min_out() public {
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
-        vm.warp(block.timestamp + 10 minutes);
+        vm.warp(block.timestamp + 10 seconds);
         BuybackAndBurn bb = new BuybackAndBurn(address(hook), key, platform);
         vm.prank(buyer);
         jig.transfer(address(bb), 20_000e18);
@@ -163,7 +163,7 @@ contract RegressionsForkTest is Test {
     function test_tokens_minted_after_a_pull_earn_nothing_from_it() public {
         HolderDrip drip = new HolderDrip(address(hook), address(nft));
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
-        vm.warp(block.timestamp + 10 minutes);
+        vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -100_000e18, "");
         drip.pull();
         uint256 perToken = drip.owed(1);
@@ -188,7 +188,7 @@ contract RegressionsForkTest is Test {
     function test_claimFor_cannot_strand_the_drip() public {
         HolderDrip drip = new HolderDrip(address(hook), address(nft));
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
-        vm.warp(block.timestamp + 10 minutes);
+        vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -100_000e18, "");
         uint256 slice = hook.claimable(address(drip));
         hook.claimFor(address(drip)); // attacker pushes it first
@@ -222,6 +222,49 @@ contract RegressionsForkTest is Test {
         vm.prank(address(factory));
         ac.notify(address(0x1234));
         assertGt(ac.receivedAt(address(0x1234)), 0);
+    }
+
+
+    function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+    }
+
+    // creator allocation + dev buy + settable fee
+    function test_creator_allocation_dev_buy_and_settable_fee() public {
+        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        bool coinIs0 = predicted < address(jig);
+        uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
+        uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
+        int24 startTick = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lower; int24 upper;
+        if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
+        CoinFactory.LaunchParams memory p = _params(address(nft), 10_000, address(0), sqrtP, lower, upper);
+        p.creatorBps = 300; // 3% to the creator's wallet
+        p.devBuyJig = 50_000e18; // and a dev buy
+        p.devBuyMinCoin = 1;
+        vm.prank(buyer);
+        jig.transfer(creator, 50_000e18);
+        vm.startPrank(creator);
+        jig.approve(address(factory), 50_000e18);
+        (, address c) = factory.launch{value: 0.01 ether}(p);
+        vm.stopPrank();
+        CreatorCoin coin = CreatorCoin(c);
+        assertGt(coin.balanceOf(creator), 30_000_000e18, "3% plus the dev buy");
+        assertEq(jig.balanceOf(creator), 0, "dev buy JIG spent");
+        // the dev buy paid the 60% snipe fee into the hook
+        assertGt(hook.totalClaimable(), 0);
+        // settable launch fee
+        vm.prank(buyer);
+        vm.expectRevert(CoinFactory.NotPlatform.selector);
+        factory.setLaunchFee(1);
+        vm.prank(platform);
+        factory.setLaunchFee(0.02 ether);
+        assertEq(factory.launchFeeWei(), 0.02 ether);
+        // too much creator allocation refused
+        p.creatorBps = 501; p.devBuyJig = 0;
+        vm.prank(creator);
+        vm.expectRevert(CoinFactory.CollectionHasCoin.selector); // same collection; the share check comes after
+        factory.launch{value: 0.02 ether}(p);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

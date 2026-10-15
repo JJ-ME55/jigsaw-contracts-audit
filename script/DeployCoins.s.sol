@@ -9,11 +9,11 @@ import {AirdropClaim} from "../src/AirdropClaim.sol";
 
 /// Phase 2 deploy: the shared CreatorFeeHook and the CoinFactory, bound to an existing JIG set.
 ///
-/// Sepolia only. Reads LAUNCH_PK (deployer = hook owner), JIG, POT, VESTING, optional PLATFORM
+/// Sepolia only. Reads LAUNCH_PK (deployer = hook owner), JIG, POT, optional PLATFORM
 /// (default deployer), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
 ///
 ///   set -a; . ../backend/.env; set +a
-///   JIG=0x... POT=0x... VESTING=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
+///   JIG=0x... POT=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
 contract DeployCoins is Script {
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     uint160 constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG);
@@ -26,7 +26,6 @@ contract DeployCoins is Script {
         address deployer = vm.addr(pk);
         address jig = vm.envAddress("JIG");
         address pot = vm.envAddress("POT");
-        address vesting = vm.envAddress("VESTING");
         address platform = vm.envOr("PLATFORM", deployer);
         address airdrop = vm.envOr("AIRDROP", pot);
         uint256 launchFee = vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
@@ -36,7 +35,7 @@ contract DeployCoins is Script {
         (address predicted, bytes32 salt) = _mine(type(CreatorFeeHook).creationCode, args);
         CreatorFeeHook hook = new CreatorFeeHook{salt: salt}(poolManager, jig, deployer, platform, pot);
         require(address(hook) == predicted, "hook address mismatch");
-        CoinFactory factory = new CoinFactory(posm, permit2, address(hook), vesting, jig, platform, airdrop, launchFee);
+        CoinFactory factory = new CoinFactory(posm, permit2, address(hook), jig, platform, airdrop, launchFee);
         hook.setFactory(address(factory));
         if (airdrop != pot) {
             // bind the AirdropClaim to this factory so only it can start unset-drop clocks (owner must be the deployer)

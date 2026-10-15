@@ -15,9 +15,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// @title JIGLaunchHook
 /// @notice The launch-window hook for the JIG/ETH pool (launch plan, 15 Oct 2026).
 ///
-///   - For WINDOW (10 minutes) after the pool is initialised, a swap whose tx.origin
-///     is on the allowlist pays NORMAL_FEE (1%); every other swap pays OUTSIDER_FEE
-///     (60%). After the window everyone pays 1%. All of it is LP fee, and the only LP
+///   - For WINDOW (5 minutes) after the pool is initialised, a swap whose tx.origin
+///     is on the allowlist pays NORMAL_FEE (1.5%); every other swap pays OUTSIDER_FEE
+///     (60%). After the window everyone pays 1.5%. All of it is LP fee, and the only LP
 ///     is JIGLaunch, whose fees go to the pot. So the sniper tax fills the pot.
 ///   - The allowlist is a merkle root of keccak256(abi.encode(address)) leaves
 ///     (OpenZeppelin double-hash), set by the owner before the pool exists. Swappers
@@ -32,9 +32,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 contract JIGLaunchHook is IHooks {
     using LPFeeLibrary for uint24;
 
-    uint24 public constant NORMAL_FEE = 10_000; // 1%
+    uint24 public constant NORMAL_FEE = 15_000; // 1.5%
     uint24 public constant OUTSIDER_FEE = 600_000; // 60%
-    uint64 public constant WINDOW = 10 minutes;
+    uint64 public constant WINDOW = 5 minutes;
 
     IPoolManager public immutable poolManager;
     address public immutable jig;

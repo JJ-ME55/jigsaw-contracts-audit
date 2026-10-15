@@ -26,13 +26,14 @@ contract JIGLaunchForkTest is Test {
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     // Launch parameters (see script/DeployJIG.s.sol for the reasoning)
-    uint24 constant FEE = 10_000; // 1%
+    uint24 constant FEE = 15_000; // 1.5%
     int24 constant TICK_SPACING = 200;
     int24 constant TICK_UPPER = 202_400;
     uint160 SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER); // start price at the range top
     int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     address owner = makeAddr("owner");
+    address platform = makeAddr("platform");
     address launcher = makeAddr("launcher");
     address buyer = makeAddr("buyer");
 
@@ -43,7 +44,7 @@ contract JIGLaunchForkTest is Test {
     function setUp() public {
         vm.createSelectFork("sepolia");
         pot = new PotVault(owner);
-        launch = new JIGLaunch(POSM, PERMIT2, launcher, address(pot));
+        launch = new JIGLaunch(POSM, PERMIT2, launcher, address(pot), platform);
         jig = new JIG(address(launch), address(pot));
         vm.prank(launcher);
         launch.setJig(address(jig));
@@ -100,9 +101,12 @@ contract JIGLaunchForkTest is Test {
         assertLt(got, 616_000_000e18);
 
         uint256 potBefore = address(pot).balance;
+        uint256 teamBefore = platform.balance;
         launch.collectFees();
-        uint256 feeEth = address(pot).balance - potBefore;
-        assertApproxEqRel(feeEth, 0.01 ether, 0.01e18, "1% of 1 ETH to the pot");
+        uint256 feeEth = address(pot).balance - potBefore + platform.balance - teamBefore;
+        assertApproxEqRel(feeEth, 0.015 ether, 0.01e18, "1.5% of 1 ETH collected");
+        assertApproxEqRel(platform.balance - teamBefore, feeEth / 3, 0.01e18, "a third to the team");
+        assertApproxEqRel(address(pot).balance - potBefore, feeEth * 2 / 3, 0.01e18, "two thirds to the pot");
         assertEq(IERC721(POSM).ownerOf(launch.tokenId()), address(launch), "position still locked");
     }
 

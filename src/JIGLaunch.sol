@@ -21,7 +21,8 @@ import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 ///         single-sided with every JIG it holds, and mints the LP position to this
 ///         contract. There is no function to transfer the position or remove
 ///         liquidity, so the LP is locked forever. LP fees can be collected by
-///         anyone, and only ever go to the pot vault.
+///         anyone: TEAM_BPS of them go to the platform wallet, the rest to the pot vault
+///         (Jj, 15 Oct: some of the JIG pool's 1.5% straight to the team, the rest to the pot).
 ///
 ///         Single-sided: the range sits entirely below the starting price
 ///         (tickLower < tickUpper <= startTick), so the position holds JIG only.
@@ -37,6 +38,8 @@ contract JIGLaunch {
     IAllowanceTransfer public immutable permit2;
     address public immutable launcher;
     address public immutable potVault;
+    address public immutable platform;
+    uint16 public constant TEAM_BPS = 3333; // a third of collected fees to the team, two thirds to the pot
 
     IERC20 public jig;
     PoolKey public poolKey;
@@ -44,7 +47,7 @@ contract JIGLaunch {
     bool public launched;
 
     event Launched(uint256 indexed tokenId, uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 jigSeeded);
-    event FeesCollected(address indexed to);
+    event FeesCollected(uint256 ethTotal, uint256 jigTotal);
 
     error NotLauncher();
     error AlreadyLaunched();
@@ -52,10 +55,12 @@ contract JIGLaunch {
     error JigNotSet();
     error RangeNotBelowPrice();
     error ZeroAddress();
+    error PayoutFailed();
     error PriceMismatch();
 
-    constructor(address posm_, address permit2_, address launcher_, address potVault_) {
-        if (posm_ == address(0) || permit2_ == address(0) || launcher_ == address(0) || potVault_ == address(0)) revert ZeroAddress();
+    constructor(address posm_, address permit2_, address launcher_, address potVault_, address platform_) {
+        if (posm_ == address(0) || permit2_ == address(0) || launcher_ == address(0) || potVault_ == address(0) || platform_ == address(0)) revert ZeroAddress();
+        platform = platform_;
         posm = IPositionManager(posm_);
         poolManager = IPositionManager(posm_).poolManager();
         permit2 = IAllowanceTransfer(permit2_);
@@ -122,16 +127,35 @@ contract JIGLaunch {
         emit Launched(id, sqrtPriceX96, tickLower, tickUpper, liquidity, amount - jig.balanceOf(address(this)));
     }
 
-    /// @notice Collect accrued LP fees to the pot vault. Anyone may call. Liquidity is untouched.
+    /// @notice Collect accrued LP fees and split them: TEAM_BPS to platform, the rest to the pot. Anyone may call. Liquidity is untouched.
     function collectFees() external {
         if (!launched) revert NotLaunched();
         bytes memory actions = abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY), uint8(Actions.TAKE_PAIR));
         bytes[] memory params = new bytes[](2);
         params[0] = abi.encode(tokenId, uint256(0), uint128(0), uint128(0), bytes(""));
-        params[1] = abi.encode(poolKey.currency0, poolKey.currency1, potVault);
+        params[1] = abi.encode(poolKey.currency0, poolKey.currency1, address(this));
         posm.modifyLiquidities(abi.encode(actions, params), block.timestamp);
-        emit FeesCollected(potVault);
+        emit FeesCollected(address(this).balance, jig.balanceOf(address(this)));
+        _payout();
     }
+
+    /// @dev Split whatever this contract holds of ETH and JIG: TEAM_BPS to platform, the rest to the pot.
+    function _payout() internal {
+        uint256 eth = address(this).balance;
+        if (eth > 0) {
+            uint256 team = (eth * TEAM_BPS) / 10_000;
+            (bool a,) = platform.call{value: team}("");
+            (bool b,) = potVault.call{value: eth - team}("");
+            if (!a || !b) revert PayoutFailed();
+        }
+        uint256 j = jig.balanceOf(address(this));
+        if (j > 0) {
+            uint256 team = (j * TEAM_BPS) / 10_000;
+            jig.safeTransfer(platform, team);
+            jig.safeTransfer(potVault, j - team);
+        }
+    }
+
 
     /// @dev PositionManager mints with plain _mint, but accept safe transfers too.
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

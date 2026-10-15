@@ -64,21 +64,21 @@ contract FlywheelsForkTest is Test {
     function setUp() public {
         vm.createSelectFork("sepolia");
         pot = new PotVault(owner);
-        launch = new JIGLaunch(POSM, PERMIT2, owner, address(pot));
+        launch = new JIGLaunch(POSM, PERMIT2, owner, address(pot), platform);
         jig = new JIG(address(launch), address(pot));
         vesting = new Vesting();
         vm.startPrank(owner);
         launch.setJig(address(jig));
         // hookless JIG/ETH pool, 1%, $4k start, full range
-        launch.launch(10_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
+        launch.launch(15_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
         vm.stopPrank();
-        jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 10_000, tickSpacing: 200, hooks: IHooks(address(0))});
+        jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 15_000, tickSpacing: 200, hooks: IHooks(address(0))});
 
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xF1F1) << 20));
         deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         airdrop = new AirdropClaim(platform, address(pot));
-        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(airdrop), 0.01 ether);
+        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(airdrop), 0.01 ether);
         vm.prank(owner);
         hook.setFactory(address(factory));
         vm.prank(platform);
@@ -106,10 +106,10 @@ contract FlywheelsForkTest is Test {
         int24 lower; int24 upper;
         if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
         vm.prank(creator);
-        (, address c) = factory.launch{value: 0.01 ether}(address(nft), "Cool", "COOL", 10_000, flywheel, sqrtP, lower, upper);
+        (, address c) = factory.launch{value: 0.01 ether}(_params(address(nft), 10_000, flywheel, sqrtP, lower, upper));
         coin = CreatorCoin(c);
         key = factory.poolKeyOf(factory.count() - 1);
-        vm.warp(block.timestamp + 10 minutes); // past the snipe window
+        vm.warp(block.timestamp + 10 seconds); // past the snipe window
     }
 
     function _buyCoin(PoolKey memory key, bool coinIs0, uint256 jigIn) internal {
@@ -269,6 +269,11 @@ contract FlywheelsForkTest is Test {
         assertEq(deep.tokenId(), id, "same position");
         assertGt(IPositionManager(POSM).getPositionLiquidity(id), liq1, "liquidity grew");
         deep.collectFees(); // no revert, fees (if any) go to the pot
+    }
+
+
+    function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

@@ -26,12 +26,14 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///   claimable balances: creator, flywheel module, platform, JIG pot and the LP-deepening
 ///   module. All payouts are pull (claim() / claimFor()), never push.
 ///
-///   Fee split, in basis points of the fee: flywheel 2000, pot 300, deepening 200,
-///   platform by band (1% -> 3500, 2-3% -> 4000, 4-6% -> 4500, 7-10% -> 5000), creator the
-///   remainder (40% / 35% / 30% / 25%).
+///   Fee split, in basis points of the fee: pot 300 and deepening 200 fixed; platform by
+///   band (1% -> 2500, 2-3% -> 3000, 4-6% -> 3500, 7-10% -> 4000); the rest is the
+///   creator+flywheel block (7000 / 6500 / 6000 / 5500), which the creator divides as they
+///   like (default: flywheel 2000, creator the remainder). Balances unclaimed for
+///   RECYCLE_AFTER are folded back through the same split by anyone.
 ///
-///   Anti-snipe: for SNIPE_WINDOW after launch the fee decays linearly from SNIPE_FEE
-///   (60%) down to the chosen fee.
+///   Anti-snipe: for SNIPE_WINDOW (seconds, pump-style) after launch the fee decays
+///   linearly from SNIPE_FEE (60%) down to the chosen fee.
 ///
 /// Address must carry exactly BEFORE_INITIALIZE | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA
 /// (0x2044) in its low 14 bits.
@@ -45,6 +47,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         address creator;
         address flywheel; // module that receives the flywheel slice; address(0) = creator
         uint24 feePips; // 10_000 (1%) .. 100_000 (10%)
+        uint16 creatorBps; // creator's share of the fee; flywheel gets block - creatorBps
         uint64 launchedAt;
         bool coinIs0;
         bool registered;
@@ -53,10 +56,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     uint24 public constant MIN_FEE = 10_000;
     uint24 public constant MAX_FEE = 100_000;
     uint24 public constant SNIPE_FEE = 600_000;
-    uint64 public constant SNIPE_WINDOW = 10 minutes;
+    uint64 public constant SNIPE_WINDOW = 10 seconds;
+    uint64 public constant RECYCLE_AFTER = 7 days;
     uint256 internal constant PIPS = 1_000_000;
 
-    uint16 public constant FLYWHEEL_BPS = 2000;
+    uint16 public constant DEFAULT_FLYWHEEL_BPS = 2000;
     uint16 public constant POT_BPS = 300;
     uint16 public constant DEEPEN_BPS = 200;
 
@@ -70,11 +74,14 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
 
     mapping(PoolId => Config) public pools;
     mapping(address => uint256) public claimable; // JIG owed, by recipient
+    mapping(address => uint64) public lastCredit; // when a recipient was last credited; stale balances recycle
     mapping(PoolId => uint256) public pendingCoin; // coin claims not yet converted (partial fills), per pool
     uint256 public totalClaimable;
     bool private _converting;
 
-    event PoolRegistered(PoolId indexed id, address indexed coin, address indexed creator, uint24 feePips, address flywheel);
+    event PoolRegistered(PoolId indexed id, address indexed coin, address indexed creator, uint24 feePips, address flywheel, uint16 creatorBps);
+    event CreatorShareSet(PoolId indexed id, uint16 creatorBps);
+    event Recycled(PoolId indexed id, address indexed from, uint256 amount);
     event FeeLowered(PoolId indexed id, uint24 feePips);
     event FactorySet_(address factory);
     event DeepeningSet_(address deepening);
@@ -91,6 +98,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error AlreadyRegistered();
     error BadPool();
     error BadFee();
+    error BadShare();
+    error NotStale();
     error HookNotImplemented();
 
     constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
@@ -141,7 +150,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Called by the factory before it initialises the pool.
-    function register(PoolKey calldata key, address creator, address flywheel, uint24 feePips) external {
+    function register(PoolKey calldata key, address creator, address flywheel, uint24 feePips, uint16 creatorBps) external {
         if (msg.sender != factory) revert NotFactory();
         if (feePips < MIN_FEE || feePips > MAX_FEE || feePips % MIN_FEE != 0) revert BadFee();
         if (address(key.hooks) != address(this) || key.fee != 0) revert BadPool();
@@ -153,16 +162,30 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         else revert BadPool();
         PoolId id = key.toId();
         if (pools[id].registered) revert AlreadyRegistered();
+        uint16 block_ = creatorBlockBps(feePips);
+        if (creatorBps == 0) creatorBps = block_ - DEFAULT_FLYWHEEL_BPS;
+        if (creatorBps > block_) revert BadShare();
         pools[id] = Config({
             coin: coinIs0 ? c0 : c1,
             creator: creator,
             flywheel: flywheel,
             feePips: feePips,
+            creatorBps: creatorBps,
             launchedAt: uint64(block.timestamp),
             coinIs0: coinIs0,
             registered: true
         });
-        emit PoolRegistered(id, coinIs0 ? c0 : c1, creator, feePips, flywheel);
+        emit PoolRegistered(id, coinIs0 ? c0 : c1, creator, feePips, flywheel, creatorBps);
+    }
+
+    /// @notice The creator may move the slider between themselves and the flywheel at any time.
+    function setCreatorShare(PoolKey calldata key, uint16 creatorBps) external {
+        Config storage c = pools[key.toId()];
+        if (!c.registered) revert NotRegistered();
+        if (msg.sender != c.creator) revert NotCreator();
+        if (creatorBps > creatorBlockBps(c.feePips)) revert BadShare();
+        c.creatorBps = creatorBps;
+        emit CreatorShareSet(key.toId(), creatorBps);
     }
 
     /// @notice The creator may lower the fee, never raise it.
@@ -172,6 +195,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (msg.sender != c.creator) revert NotCreator();
         if (feePips < MIN_FEE || feePips >= c.feePips || feePips % MIN_FEE != 0) revert BadFee();
         c.feePips = feePips;
+        uint16 block_ = creatorBlockBps(feePips);
+        if (c.creatorBps > block_) c.creatorBps = block_; // a lower fee widens the block; never narrows it below the slider
         emit FeeLowered(key.toId(), feePips);
     }
 
@@ -185,10 +210,32 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     function platformBps(uint24 feePips) public pure returns (uint16) {
-        if (feePips <= 10_000) return 3500;
-        if (feePips <= 30_000) return 4000;
-        if (feePips <= 60_000) return 4500;
-        return 5000;
+        if (feePips <= 10_000) return 2500;
+        if (feePips <= 30_000) return 3000;
+        if (feePips <= 60_000) return 3500;
+        return 4000;
+    }
+
+    /// @notice The creator+flywheel block: everything after platform, pot and deepening.
+    function creatorBlockBps(uint24 feePips) public pure returns (uint16) {
+        return 10_000 - platformBps(feePips) - POT_BPS - DEEPEN_BPS;
+    }
+
+    /// @notice Fold a balance that has sat unclaimed for RECYCLE_AFTER back through the pool's split. Anyone may call.
+    ///         Only the pool's creator and flywheel recipients are recyclable; platform, pot and deepening are ours.
+    function recycle(PoolKey calldata key, address from) external nonReentrant returns (uint256 amount) {
+        PoolId id = key.toId();
+        Config storage c = pools[id];
+        if (!c.registered) revert NotRegistered();
+        address fly = c.flywheel == address(0) ? c.creator : c.flywheel;
+        if (from != c.creator && from != fly) revert NotStale();
+        if (block.timestamp < lastCredit[from] + RECYCLE_AFTER) revert NotStale();
+        amount = claimable[from];
+        if (amount == 0) revert NotStale();
+        claimable[from] = 0;
+        totalClaimable -= amount;
+        _split(c, amount);
+        emit Recycled(id, from, amount);
     }
 
     // ---------------- claims ----------------
@@ -298,11 +345,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     function _split(Config storage c, uint256 amount) internal {
-        uint256 fly = (amount * FLYWHEEL_BPS) / 10_000;
         uint256 potA = (amount * POT_BPS) / 10_000;
         uint256 deep = (amount * DEEPEN_BPS) / 10_000;
         uint256 plat = (amount * platformBps(c.feePips)) / 10_000;
-        uint256 creator = amount - fly - potA - deep - plat;
+        uint256 creator = (amount * c.creatorBps) / 10_000;
+        uint256 fly = amount - potA - deep - plat - creator;
 
         _credit(c.flywheel == address(0) ? c.creator : c.flywheel, fly);
         _credit(pot, potA);
@@ -313,7 +360,10 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     function _credit(address to, uint256 amount) internal {
-        if (amount > 0) claimable[to] += amount;
+        if (amount > 0) {
+            claimable[to] += amount;
+            lastCredit[to] = uint64(block.timestamp);
+        }
     }
 
     // ---------------- unused hooks ----------------

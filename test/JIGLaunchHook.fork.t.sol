@@ -28,6 +28,7 @@ contract JIGLaunchHookForkTest is Test {
     int24 constant TICK_LOWER = -887_200;
 
     address owner = makeAddr("owner");
+    address platform = makeAddr("platform");
     address launcher = makeAddr("launcher");
     address friend = makeAddr("friend");
     address friend2 = makeAddr("friend2");
@@ -45,7 +46,7 @@ contract JIGLaunchHookForkTest is Test {
     function setUp() public {
         vm.createSelectFork("sepolia");
         pot = new PotVault(owner);
-        launch = new JIGLaunch(POSM, PERMIT2, launcher, address(pot));
+        launch = new JIGLaunch(POSM, PERMIT2, launcher, address(pot), platform);
         jig = new JIG(address(launch), address(pot));
         vm.prank(launcher);
         launch.setJig(address(jig));
@@ -89,14 +90,14 @@ contract JIGLaunchHookForkTest is Test {
 
     function test_window_opened_on_init() public view {
         assertTrue(hook.initialized());
-        assertEq(hook.windowEnd(), uint64(block.timestamp) + 10 minutes);
+        assertEq(hook.windowEnd(), uint64(block.timestamp) + 5 minutes);
     }
 
     function test_friend_pays_1pct_sniper_pays_60pct() public {
         uint256 gotFriend = _buy(friend, 0.01 ether, abi.encode(_proofFriend()));
         uint256 gotSniper = _buy(sniper, 0.01 ether, abi.encode(_proofFriend())); // even with a friend's proof
         // Same size buys back to back at a $4k start move the price, so compare against the fee quotes.
-        assertEq(hook.quoteFee(friend, _proofFriend()), 10_000);
+        assertEq(hook.quoteFee(friend, _proofFriend()), 15_000);
         assertEq(hook.quoteFee(sniper, _proofFriend()), 600_000);
         assertLt(gotSniper * 100, gotFriend * 45, "sniper gets well under half as much JIG");
         assertGt(gotSniper, 0);
@@ -109,8 +110,8 @@ contract JIGLaunchHookForkTest is Test {
     }
 
     function test_after_window_everyone_pays_1pct() public {
-        vm.warp(block.timestamp + 10 minutes);
-        assertEq(hook.quoteFee(sniper, _proofFriend()), 10_000);
+        vm.warp(block.timestamp + 5 minutes);
+        assertEq(hook.quoteFee(sniper, _proofFriend()), 15_000);
         uint256 a = _buy(sniper, 0.01 ether, "");
         uint256 b = _buy(friend, 0.01 ether, abi.encode(_proofFriend()));
         // second buy is a touch pricier; within 15%
@@ -119,9 +120,9 @@ contract JIGLaunchHookForkTest is Test {
 
     function test_sniper_tax_fills_pot() public {
         _buy(sniper, 1 ether, "");
-        uint256 before = address(pot).balance;
+        uint256 before = address(pot).balance + platform.balance;
         launch.collectFees();
-        assertApproxEqRel(address(pot).balance - before, 0.6 ether, 0.01e18, "60% of 1 ETH to the pot");
+        assertApproxEqRel(address(pot).balance + platform.balance - before, 0.6 ether, 0.01e18, "60% of 1 ETH collected, split team/pot");
     }
 
     function test_allowlist_locked_after_init() public {

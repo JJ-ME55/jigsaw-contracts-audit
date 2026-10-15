@@ -43,11 +43,12 @@ contract DeployJIG is Script {
         uint256 pk = vm.envUint("LAUNCH_PK");
         address deployer = vm.addr(pk);
         address potOwner = vm.envOr("POT_OWNER", deployer);
+        address platform = vm.envOr("PLATFORM", deployer);
         bytes32 root = vm.envOr("ALLOWLIST_ROOT", bytes32(0));
 
         vm.startBroadcast(pk);
         PotVault pot = new PotVault(potOwner);
-        JIGLaunch launch = new JIGLaunch(posm, permit2, deployer, address(pot));
+        JIGLaunch launch = new JIGLaunch(posm, permit2, deployer, address(pot), platform);
         JIG jig = new JIG(address(launch), address(pot));
         Vesting vesting = new Vesting();
         launch.setJig(address(jig));

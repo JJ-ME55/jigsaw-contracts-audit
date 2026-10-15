@@ -8,53 +8,70 @@ import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {Actions} from "v4-periphery/src/libraries/Actions.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {CreatorCoin} from "./CreatorCoin.sol";
 import {CreatorFeeHook} from "./CreatorFeeHook.sol";
-import {Vesting} from "./Vesting.sol";
 
 /// @title CoinFactory
-/// @notice Launches a creator coin for a collection (Build Spec §4). One call:
-///         deploys the coin (fixed 1B supply), creates the coin/JIG v4 pool on the
-///         shared CreatorFeeHook, seeds it single-sided with 90% of supply, holds the LP
-///         NFT forever (no transfer or remove function), locks 5% for the creator in
-///         Vesting (6 months) and sends 5% to the airdrop recipient (the AirdropClaim
-///         contract once it exists; the pot until then). Takes a flat launch fee in ETH.
-contract CoinFactory is ReentrancyGuard {
+/// @notice Launches a creator coin for a collection (Build Spec §4, revised 15 Oct). One call:
+///         deploys the coin (fixed 1B supply), creates the coin/JIG v4 pool on the shared
+///         CreatorFeeHook, seeds it single-sided, holds the LP NFT forever (no transfer or
+///         remove function), sends 5% to the airdrop recipient, and gives the creator what
+///         they chose: up to 5% of supply straight to their wallet, and/or a dev buy with
+///         JIG in the same transaction before anyone else can trade. Takes a flat launch fee
+///         in ETH that the platform can update to track a dollar price.
+contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 public constant SUPPLY = 1_000_000_000e18;
-    uint256 public constant POOL_SHARE = 900_000_000e18;
-    uint256 public constant CREATOR_SHARE = 50_000_000e18;
-    uint256 public constant AIRDROP_SHARE = 50_000_000e18;
-    uint64 public constant CREATOR_VEST = 180 days;
+    uint256 public constant AIRDROP_SHARE = 50_000_000e18; // 5%
+    uint16 public constant MAX_CREATOR_BPS = 500; // up to 5% of supply to the creator's wallet
     int24 public constant TICK_SPACING = 200;
 
     IPositionManager public immutable posm;
+    IPoolManager public immutable poolManager;
     IAllowanceTransfer public immutable permit2;
     CreatorFeeHook public immutable hook;
-    Vesting public immutable vesting;
     IERC20 public immutable jig;
     address public immutable platform;
     address public immutable airdropRecipient;
-    uint256 public immutable launchFeeWei;
+    uint256 public launchFeeWei;
 
     struct Launch {
         address coin;
         address collection;
         address creator;
         uint256 tokenId;
-        uint256 vestingId;
         PoolKey key;
+    }
+
+    struct LaunchParams {
+        address collection;
+        string name;
+        string symbol;
+        uint24 feePips; // 10_000 (1%) .. 100_000 (10%) in steps of 10_000
+        address flywheel; // module for the flywheel slice; address(0) = creator wallet
+        uint16 creatorShareBps; // creator's share of the fee within the creator+flywheel block; 0 = default (flywheel 20%)
+        uint16 creatorBps; // share of supply to the creator's wallet at launch, 0..500 (0..5%)
+        uint256 devBuyJig; // JIG the creator spends buying the coin in this transaction, 0 for none (needs approval)
+        uint256 devBuyMinCoin; // slippage floor for the dev buy
+        uint160 sqrtPriceX96; // start price as sqrt(currency1 per currency0) * 2^96, for the pair's ordering
+        int24 tickLower; // seeded range, single-sided on the coin
+        int24 tickUpper;
     }
 
     Launch[] public launches;
     mapping(address collection => address coin) public coinOf;
 
-    event CoinLaunched(uint256 indexed index, address indexed coin, address indexed collection, address creator, uint24 feePips, address flywheel, uint256 tokenId);
+    event CoinLaunched(uint256 indexed index, address indexed coin, address indexed collection, address creator, uint24 feePips, address flywheel, uint256 tokenId, uint256 creatorTokens, uint256 devBuyJig, uint256 devBuyCoin);
+    event LaunchFeeSet(uint256 launchFeeWei);
 
     error ZeroAddress();
     error WrongFee();
@@ -63,51 +80,40 @@ contract CoinFactory is ReentrancyGuard {
     error FeeSendFailed();
     error NotCollectionOwner();
     error PoolInitFailed();
+    error NotPlatform();
+    error NotPoolManager();
+    error TooMuchCreator();
+    error TooLittleOut();
 
-    constructor(
-        address posm_,
-        address permit2_,
-        address hook_,
-        address vesting_,
-        address jig_,
-        address platform_,
-        address airdropRecipient_,
-        uint256 launchFeeWei_
-    ) {
-        if (posm_ == address(0) || permit2_ == address(0) || hook_ == address(0) || vesting_ == address(0) || jig_ == address(0) || platform_ == address(0) || airdropRecipient_ == address(0)) revert ZeroAddress();
+    constructor(address posm_, address permit2_, address hook_, address jig_, address platform_, address airdropRecipient_, uint256 launchFeeWei_) {
+        if (posm_ == address(0) || permit2_ == address(0) || hook_ == address(0) || jig_ == address(0) || platform_ == address(0) || airdropRecipient_ == address(0)) revert ZeroAddress();
         posm = IPositionManager(posm_);
+        poolManager = IPositionManager(posm_).poolManager();
         permit2 = IAllowanceTransfer(permit2_);
         hook = CreatorFeeHook(hook_);
-        vesting = Vesting(vesting_);
         jig = IERC20(jig_);
         platform = platform_;
         airdropRecipient = airdropRecipient_;
         launchFeeWei = launchFeeWei_;
     }
 
-    /// @param feePips creator-chosen fee, 10_000 (1%) to 100_000 (10%) in steps of 10_000
-    /// @param flywheel module that receives the flywheel slice, address(0) = creator
-    /// @param sqrtPriceX96 start price as sqrt(currency1 per currency0) * 2^96, computed off chain for the pair's ordering
-    /// @param tickLower,tickUpper the seeded range, single-sided on the coin: entirely below the price if the coin is currency1,
-    ///        entirely above it if the coin is currency0
-    function launch(
-        address collection,
-        string calldata name,
-        string calldata symbol,
-        uint24 feePips,
-        address flywheel,
-        uint160 sqrtPriceX96,
-        int24 tickLower,
-        int24 tickUpper
-    ) external payable nonReentrant returns (uint256 index, address coinAddr) {
-        if (msg.value != launchFeeWei) revert WrongFee();
-        if (collection == address(0) || collection.code.length == 0) revert ZeroAddress();
-        if (coinOf[collection] != address(0)) revert CollectionHasCoin();
-        if (!_controlsCollection(msg.sender, collection)) revert NotCollectionOwner();
+    /// @notice The platform updates the ETH launch fee to track its dollar price.
+    function setLaunchFee(uint256 launchFeeWei_) external {
+        if (msg.sender != platform) revert NotPlatform();
+        launchFeeWei = launchFeeWei_;
+        emit LaunchFeeSet(launchFeeWei_);
+    }
 
-        CreatorCoin coin = new CreatorCoin(name, symbol, SUPPLY, collection, address(this));
+    function launch(LaunchParams calldata p) external payable nonReentrant returns (uint256 index, address coinAddr) {
+        if (msg.value != launchFeeWei) revert WrongFee();
+        if (p.collection == address(0) || p.collection.code.length == 0) revert ZeroAddress();
+        if (coinOf[p.collection] != address(0)) revert CollectionHasCoin();
+        if (!_controlsCollection(msg.sender, p.collection)) revert NotCollectionOwner();
+        if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
+
+        CreatorCoin coin = new CreatorCoin(p.name, p.symbol, SUPPLY, p.collection, address(this));
         coinAddr = address(coin);
-        coinOf[collection] = coinAddr;
+        coinOf[p.collection] = coinAddr;
 
         bool coinIs0 = coinAddr < address(jig);
         PoolKey memory key = PoolKey({
@@ -118,40 +124,76 @@ contract CoinFactory is ReentrancyGuard {
             hooks: IHooks(address(hook))
         });
 
-        int24 startTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
-        if (tickLower >= tickUpper) revert RangeWrongSide();
-        if (coinIs0 ? tickLower <= startTick : tickUpper > startTick) revert RangeWrongSide();
+        int24 startTick = TickMath.getTickAtSqrtPrice(p.sqrtPriceX96);
+        if (p.tickLower >= p.tickUpper) revert RangeWrongSide();
+        if (coinIs0 ? p.tickLower <= startTick : p.tickUpper > startTick) revert RangeWrongSide();
 
-        hook.register(key, msg.sender, flywheel, feePips);
-        if (posm.initializePool(key, sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
+        hook.register(key, msg.sender, p.flywheel, p.feePips, p.creatorShareBps);
+        if (posm.initializePool(key, p.sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
 
-        uint128 liquidity = coinIs0
-            ? LiquidityAmounts.getLiquidityForAmount0(TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), POOL_SHARE)
-            : LiquidityAmounts.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), POOL_SHARE);
+        uint256 creatorTokens = (SUPPLY * p.creatorBps) / 10_000;
+        uint256 tokenId = _seed(coin, key, coinIs0, SUPPLY - AIRDROP_SHARE - creatorTokens, p.tickLower, p.tickUpper);
 
-        coin.approve(address(permit2), POOL_SHARE);
-        permit2.approve(coinAddr, address(posm), uint160(POOL_SHARE), uint48(block.timestamp + 1 hours));
-
-        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
-        bytes[] memory params = new bytes[](2);
-        params[0] = abi.encode(key, tickLower, tickUpper, liquidity, coinIs0 ? uint128(POOL_SHARE) : 0, coinIs0 ? 0 : uint128(POOL_SHARE), address(this), bytes(""));
-        params[1] = abi.encode(key.currency0, key.currency1);
-        uint256 tokenId = posm.nextTokenId();
-        posm.modifyLiquidities(abi.encode(actions, params), block.timestamp);
-
-        coin.approve(address(vesting), CREATOR_SHARE);
-        uint256 vestingId = vesting.create(coinAddr, msg.sender, CREATOR_SHARE, 0, 0, CREATOR_VEST);
+        if (creatorTokens > 0) IERC20(coinAddr).safeTransfer(msg.sender, creatorTokens);
         IERC20(coinAddr).safeTransfer(airdropRecipient, AIRDROP_SHARE);
-        // let an AirdropClaim start its unset-drop clock; a plain address ignores this
         (bool noted,) = airdropRecipient.call(abi.encodeWithSignature("notify(address)", coinAddr));
         noted;
 
+        uint256 devBuyCoin;
+        if (p.devBuyJig > 0) devBuyCoin = _devBuy(key, coinIs0, coinAddr, p.devBuyJig, p.devBuyMinCoin);
+
         index = launches.length;
-        launches.push(Launch({coin: coinAddr, collection: collection, creator: msg.sender, tokenId: tokenId, vestingId: vestingId, key: key}));
+        launches.push(Launch({coin: coinAddr, collection: p.collection, creator: msg.sender, tokenId: tokenId, key: key}));
 
         (bool ok,) = platform.call{value: msg.value}("");
         if (!ok) revert FeeSendFailed();
-        emit CoinLaunched(index, coinAddr, collection, msg.sender, feePips, flywheel, tokenId);
+        emit CoinLaunched(index, coinAddr, p.collection, msg.sender, p.feePips, p.flywheel, tokenId, creatorTokens, p.devBuyJig, devBuyCoin);
+    }
+
+    function _seed(CreatorCoin coin, PoolKey memory key, bool coinIs0, uint256 poolShare, int24 tickLower, int24 tickUpper) internal returns (uint256 tokenId) {
+        uint128 liquidity = coinIs0
+            ? LiquidityAmounts.getLiquidityForAmount0(TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), poolShare)
+            : LiquidityAmounts.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), poolShare);
+        coin.approve(address(permit2), poolShare);
+        permit2.approve(address(coin), address(posm), uint160(poolShare), uint48(block.timestamp + 1 hours));
+        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
+        bytes[] memory params = new bytes[](2);
+        params[0] = abi.encode(key, tickLower, tickUpper, liquidity, coinIs0 ? uint128(poolShare) : 0, coinIs0 ? 0 : uint128(poolShare), address(this), bytes(""));
+        params[1] = abi.encode(key.currency0, key.currency1);
+        tokenId = posm.nextTokenId();
+        posm.modifyLiquidities(abi.encode(actions, params), block.timestamp);
+    }
+
+    /// @dev Creator's dev buy: pull JIG from the creator, swap it for the coin on the fresh pool, send the coin to the creator.
+    function _devBuy(PoolKey memory key, bool coinIs0, address coinAddr, uint256 jigIn, uint256 minOut) internal returns (uint256 got) {
+        jig.safeTransferFrom(msg.sender, address(this), jigIn);
+        got = abi.decode(poolManager.unlock(abi.encode(key, coinIs0, jigIn)), (uint256));
+        if (got < minOut || got == 0) revert TooLittleOut();
+        IERC20(coinAddr).safeTransfer(msg.sender, got);
+    }
+
+    function unlockCallback(bytes calldata data) external override returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        (PoolKey memory key, bool coinIs0, uint256 jigIn) = abi.decode(data, (PoolKey, bool, uint256));
+        bool zeroForOne = !coinIs0; // JIG in, coin out
+        BalanceDelta d = poolManager.swap(
+            key,
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(jigIn), sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1}),
+            ""
+        );
+        Currency jigC = coinIs0 ? key.currency1 : key.currency0;
+        Currency coinC = coinIs0 ? key.currency0 : key.currency1;
+        int128 jigDelta = coinIs0 ? d.amount1() : d.amount0();
+        int128 coinDelta = coinIs0 ? d.amount0() : d.amount1();
+        uint256 spent = uint256(uint128(-jigDelta));
+        if (spent > 0) {
+            poolManager.sync(jigC);
+            jig.safeTransfer(address(poolManager), spent);
+            poolManager.settle();
+        }
+        uint256 got = uint256(uint128(coinDelta));
+        if (got > 0) poolManager.take(coinC, address(this), got);
+        return abi.encode(got);
     }
 
     /// @dev The caller must be the collection's owner() or creator() (both exist on LoomCollection).

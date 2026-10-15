@@ -38,6 +38,8 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     IPositionManager public immutable posm;
     IAllowanceTransfer public immutable permit2;
     address public immutable pot;
+    address public immutable platform;
+    uint16 public constant TEAM_BPS = 3333;
     PoolKey public jigPool; // ETH / JIG
 
     address public immutable keeper;
@@ -49,11 +51,12 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     uint256 public totalEthAdded;
 
     event Deepened(uint256 jigSold, uint256 ethGot, uint256 jigAdded, uint256 ethAdded, uint128 liquidity);
-    event FeesCollected(address indexed to);
+    event FeesCollected(uint256 eth, uint256 jig);
 
     error NotPoolManager();
     error ZeroAddress();
     error Nothing();
+    error PayoutFailed();
     error NotKeeper();
     error TooLittleOut();
 
@@ -64,6 +67,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         jig = hook.jig();
         poolManager = hook.poolManager();
         pot = hook.pot();
+        platform = hook.platform();
         posm = IPositionManager(posm_);
         permit2 = IAllowanceTransfer(permit2_);
         jigPool = jigPool_;
@@ -118,15 +122,31 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         // jigLeft not consumed by the position stays in the module for the next run
     }
 
-    /// @notice Collect the position's LP fees to the pot. Liquidity is untouched.
+    /// @notice Collect the position's LP fees: TEAM_BPS to platform, the rest to the pot. Liquidity is untouched.
+    ///         Collected fees are kept separate from the module's working balance by paying out in the same call.
     function collectFees() external nonReentrant {
         if (tokenId == 0) revert Nothing();
+        uint256 ethBefore = address(this).balance;
+        uint256 jigBefore = jig.balanceOf(address(this));
         bytes memory actions = abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY), uint8(Actions.TAKE_PAIR));
         bytes[] memory params = new bytes[](2);
         params[0] = abi.encode(tokenId, uint256(0), uint128(0), uint128(0), bytes(""));
-        params[1] = abi.encode(jigPool.currency0, jigPool.currency1, pot);
+        params[1] = abi.encode(jigPool.currency0, jigPool.currency1, address(this));
         posm.modifyLiquidities(abi.encode(actions, params), block.timestamp);
-        emit FeesCollected(pot);
+        uint256 eth = address(this).balance - ethBefore;
+        uint256 j = jig.balanceOf(address(this)) - jigBefore;
+        if (eth > 0) {
+            uint256 team = (eth * TEAM_BPS) / 10_000;
+            (bool a,) = platform.call{value: team}("");
+            (bool b,) = pot.call{value: eth - team}("");
+            if (!a || !b) revert PayoutFailed();
+        }
+        if (j > 0) {
+            uint256 team = (j * TEAM_BPS) / 10_000;
+            jig.safeTransfer(platform, team);
+            jig.safeTransfer(pot, j - team);
+        }
+        emit FeesCollected(eth, j);
     }
 
     /// @dev Sell `amount` JIG for ETH on the JIG/ETH pool (JIG is currency1).
