@@ -106,11 +106,12 @@ contract JIGTest is Test {
     // ---------- PotVault ----------
 
     function test_pot_receives_eth_and_tracks_available() public {
+        uint256 before = pot.available(address(0));
         vm.deal(alice, 1 ether);
         vm.prank(alice);
         (bool ok,) = address(pot).call{value: 1 ether}("");
         assertTrue(ok);
-        assertEq(pot.available(address(0)), 1 ether);
+        assertEq(pot.available(address(0)) - before, 1 ether);
         assertEq(pot.available(address(jig)), 100_000_000e18);
     }
 

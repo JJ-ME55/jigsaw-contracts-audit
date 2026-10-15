@@ -6,12 +6,13 @@ Foundry project. Spec: `../ECONOMICS-DRAFT.md` (signed off 15 Oct 2026) and the 
 
 | Contract | Address | What it does |
 |---|---|---|
-| JIG | `0x9B9D82af0209dC740447c805596EA146f8f9353f` | fixed 1,000,000,000 supply, minted once: 90% to JIGLaunch, 10% to PotVault. No mint, no tax, no owner. Burnable |
-| JIGLaunch | `0x9635ff10CC5088fF4146B36a438f95e4268609c8` | created the JIG/ETH v4 pool, seeded it single-sided with 900M JIG, holds LP NFT 40640 forever. No transfer or remove-liquidity function. `collectFees()` sends LP fees to the pot, anyone can call |
-| PotVault | `0x291e8E0D64D00CC19d66982EE14A3c3AC179f12A` | the JIG pot. Holds 100M JIG now; receives mint reserve ETH and hook slices later. Payouts are merkle claims and are switched off until `enablePayouts()` (one-way, owner only). Owner cannot withdraw |
-| Vesting | `0xC58B4abCCf1d8669e32c6104CA63a8E4Decf2862` | linear vesting with cliff for any ERC-20, irrevocable. Unused until the coin factory |
+| JIG | `0x1a69B9fb49b9B7F4366ec30b1138fF1A5BA561B1` | fixed 1,000,000,000 supply, minted once: 90% to JIGLaunch, 10% to PotVault. No mint, no tax, no owner. Burnable |
+| JIGLaunch | `0x5fBd48c44E1Db17A33BE9237B0B8877e54A34090` | created the JIG/ETH v4 pool, seeded it single-sided with 900M JIG, holds LP NFT 40643 forever. No transfer or remove-liquidity function. `collectFees()` sends LP fees to the pot, anyone can call |
+| PotVault | `0x6e92e81fD6Cb0Bf9cAb54422a64b407080fbd88B` | the JIG pot. Holds 100M JIG now; receives mint reserve ETH and hook slices later. Payouts are merkle claims and are switched off until `enablePayouts()` (one-way, owner only). Owner cannot withdraw |
+| Vesting | `0x0AfF5b1441B0F861Aece35077Ed0B5A6C69cFE01` | linear vesting with cliff for any ERC-20, irrevocable. Unused until the coin factory |
+| JIGLaunchHook | `0xcEA08441eeC642CF4fA6Acd9e4e99E7EB94De080` | the launch window: for 10 minutes after the pool opened, allowlisted tx.origin pays 1%, anyone else 60%, then 1% for all. Serves only the ETH/JIG dynamic-fee pool. CREATE2-mined address (flag bits 0x2080) |
 
-Pool on Sepolia today: ETH / JIG, 1% fee, tick spacing 200, no hook. The Sepolia deploy used the first placeholder price (1 ETH = 5,000,000 JIG). The script now carries the agreed parameters below; the Sepolia pool is redeployed when the launch hook exists.
+Pool on Sepolia: ETH / JIG, dynamic fee via the hook, tick spacing 200, launched 15 Oct 2026 with the agreed parameters below. The Sepolia allowlist is a single leaf, the operating wallet, so the window could be exercised. The first Sepolia set (JIG `0x9B9D…353f`, no hook, 1 ETH = 5M JIG) is superseded and can be ignored.
 
 ## Launch plan (agreed by Jj and Fish, 15 Oct 2026)
 
@@ -23,7 +24,9 @@ Pool on Sepolia today: ETH / JIG, 1% fee, tick spacing 200, no hook. The Sepolia
 | After 10 minutes | open to everyone, fee 1%, all LP fees to the pot forever (LP locked, pot is the only sink) |
 | Contract address | vanity prefix via a CREATE2 salt grind, on the final mainnet deploy only |
 
-The 10-minute window needs a hook on the JIG pool: `beforeSwap` checks the allowlist until `start + 10 min` and returns a 1% fee for listed wallets and a 60% override for everyone else (v4 allows dynamic LP fees up to 100%). That is the first job of the phase 2 hook work, so the JIG mainnet launch depends on it.
+The window is `JIGLaunchHook`: `beforeInitialize` records the clock and refuses any pool other than ETH/JIG dynamic-fee; `beforeSwap` returns a 1% override for a tx.origin that proves allowlist membership in `hookData` (merkle proof, OpenZeppelin double-hash leaves of `abi.encode(address)`), 60% otherwise, 1% for all after 10 minutes. tx.origin is deliberate: routers can lie about msg.sender, nobody can fake the signing EOA. Smart-contract wallets therefore can't be allowlisted; use EOAs for the FNF list.
+
+**Allowlist root:** build the tree off chain (OpenZeppelin `merkletreejs` or `@openzeppelin/merkle-tree` with `["address"]` leaves), pass the root as `ALLOWLIST_ROOT` to the deploy script, and give each friend their proof for the front end to pass as hookData. The root is fixed once the pool exists.
 
 Pot owner is the operating wallet for now. Before mainnet it must be a 2-of-2 multisig of both founders.
 
@@ -44,7 +47,7 @@ Foundry 1.8.3, solc 0.8.26, via-ir, cancun. v4-periphery was installed from its 
 
 ```bash
 forge test                                              # 14 unit tests: JIG, Vesting, PotVault
-forge test --match-contract Fork --fork-url sepolia     # 4 tests on a Sepolia fork: launch, lock, a real 1 ETH buy, fees to pot
+forge test --match-contract Fork --fork-url sepolia     # 11 tests on a Sepolia fork: launch, lock, real buys, window fees, sniper tax to pot
 ```
 
 The fork test buys JIG with 1 ETH through the real v4 PoolManager and checks about 5M JIG arrives and 0.01 ETH of fees reaches the pot.
@@ -64,10 +67,10 @@ Reads `LAUNCH_PK` (deployer and launcher) and optional `POT_OWNER`. Refuses chai
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch | Claude, 15 Oct, with 18 passing tests | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook | Claude, 15 Oct, with 25 passing tests (14 unit, 11 on a Sepolia fork) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
 ## Phase 2 (not started)
 
-Fee hook (shared, creator-set fee 1 to 10%, six-way split, converts to JIG), coin factory, holder drip, sweep and burn. Spec section 6.
+Creator-coin fee hook (shared, creator-set fee 1 to 10%, six-way split, converts to JIG), coin factory, holder drip, sweep and burn. Spec section 6. The JIG launch hook above is a separate, simpler contract and stays as is.
