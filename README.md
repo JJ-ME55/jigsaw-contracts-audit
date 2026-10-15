@@ -11,7 +11,19 @@ Foundry project. Spec: `../ECONOMICS-DRAFT.md` (signed off 15 Oct 2026) and the 
 | PotVault | `0x291e8E0D64D00CC19d66982EE14A3c3AC179f12A` | the JIG pot. Holds 100M JIG now; receives mint reserve ETH and hook slices later. Payouts are merkle claims and are switched off until `enablePayouts()` (one-way, owner only). Owner cannot withdraw |
 | Vesting | `0xC58B4abCCf1d8669e32c6104CA63a8E4Decf2862` | linear vesting with cliff for any ERC-20, irrevocable. Unused until the coin factory |
 
-Pool: ETH / JIG, 1% fee, tick spacing 200, no hook (anti-snipe hook is phase 2). Start price 1 ETH = 5,000,000 JIG (200 ETH fully diluted). Seeded range from the start price to about 1000x, so buying JIG with ETH walks the price up through that range; nothing can be sold into the pool below the start price because there is no ETH there yet.
+Pool on Sepolia today: ETH / JIG, 1% fee, tick spacing 200, no hook. The Sepolia deploy used the first placeholder price (1 ETH = 5,000,000 JIG). The script now carries the agreed parameters below; the Sepolia pool is redeployed when the launch hook exists.
+
+## Launch plan (agreed by Jj and Fish, 15 Oct 2026)
+
+| | |
+|---|---|
+| Start FDV | about $4k, a pump.fun-style start: 1 ETH = 625,000,000 JIG at $2,500 ETH. Recompute the sqrt price from the live ETH price on launch day |
+| Range | full range above the start price, single-sided JIG, no cap |
+| First 25 minutes | only allowlisted friends-and-family wallets can buy; fee 10%, all of it to the pot |
+| After 25 minutes | open to everyone, fee 1%, all LP fees to the pot forever (LP locked, pot is the only sink) |
+| Contract address | vanity prefix via a CREATE2 salt grind, on the final mainnet deploy only |
+
+The 25-minute window needs a hook on the JIG pool: `beforeSwap` checks an allowlist until `start + 25 min` and returns the override fee. That is the first job of the phase 2 hook work, so the JIG mainnet launch depends on it.
 
 Pot owner is the operating wallet for now. Before mainnet it must be a 2-of-2 multisig of both founders.
 

@@ -15,8 +15,8 @@ import {JIGLaunch} from "../src/JIGLaunch.sol";
 ///
 /// Launch parameters (to be confirmed by both founders before mainnet):
 ///   fee 1%, tick spacing 200
-///   start price 1 ETH = 5,000,000 JIG  (1B supply => 200 ETH fully diluted, ~$500k)
-///   seeded range: from the start price up to ~1000x, single-sided JIG
+///   start price 1 ETH = 625,000,000 JIG (1B supply => 1.6 ETH fully diluted, ~$4k, a pump.fun-style start)
+///   seeded range: full range above the start price, single-sided JIG, no cap
 ///
 /// Usage:
 ///   set -a; . ../backend/.env; set +a
@@ -25,9 +25,9 @@ import {JIGLaunch} from "../src/JIGLaunch.sol";
 contract DeployJIG is Script {
     uint24 constant FEE = 10_000;
     int24 constant TICK_SPACING = 200;
-    uint160 constant SQRT_PRICE = 177159557114295716651832025546752; // sqrt(5e6) * 2^96
-    int24 constant TICK_UPPER = 154_200;
-    int24 constant TICK_LOWER = 85_200;
+    uint160 constant SQRT_PRICE = 1980704062856608439838598758400000; // sqrt(6.25e8) * 2^96: 1 ETH = 625,000,000 JIG, $4k FDV at $2,500 ETH
+    int24 constant TICK_UPPER = 202_400; // just below the start tick (~202,542)
+    int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     function run() external {
         require(block.chainid != 1, "no mainnet");
