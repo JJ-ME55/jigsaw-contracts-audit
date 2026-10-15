@@ -21,9 +21,10 @@ import {CreatorCoin} from "./CreatorCoin.sol";
 ///         buys the coin back on its own pool and burns it. One instance per coin; its
 ///         address is the `flywheel` passed to CoinFactory. Anyone can trigger a run.
 ///
-///         MEV limits: at most MAX_PER_RUN JIG per run, one run per COOLDOWN, and the swap
-///         may move the price by at most ~MAX_IMPACT_BPS; whatever does not fill stays for
-///         the next run. That bounds what a sandwich can take from any single run.
+///         MEV limits: at most maxPerRun JIG per run, one run per COOLDOWN, and the swap may
+///         move the price at most ~MAX_IMPACT_BPS past a reference recorded by observe() in
+///         an earlier block, so a same-transaction pump cannot widen the bound. Whatever does
+///         not fill stays for the next run.
 contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using StateLibrary for IPoolManager;
@@ -42,6 +43,10 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
 
     uint64 public lastRun;
     uint256 public burned;
+    /// @dev Reference price recorded in an earlier block, so a caller cannot set the bound in the same tx.
+    uint160 public refSqrtPriceX96;
+    uint64 public refBlock;
+    uint64 public constant REF_MAX_AGE = 256; // blocks
 
     event Burned(uint256 jigSpent, uint256 coinBurned);
 
@@ -49,6 +54,7 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
     error ZeroAddress();
     error Nothing();
     error TooSoon();
+    error NoReference();
 
     constructor(address hook_, PoolKey memory key_, uint256 maxPerRun_) {
         if (hook_ == address(0) || maxPerRun_ == 0) revert ZeroAddress();
@@ -61,16 +67,26 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
         maxPerRun = maxPerRun_;
     }
 
+    /// @notice Record the pool price for a later run. Must be called in an earlier block than run().
+    function observe() external {
+        (uint160 sqrtP,,,) = poolManager.getSlot0(key.toId());
+        refSqrtPriceX96 = sqrtP;
+        refBlock = uint64(block.number);
+    }
+
     /// @notice Pull the slice from the hook, buy the coin with up to maxPerRun of it, burn what arrives.
+    ///         Needs observe() from an earlier block (at most REF_MAX_AGE blocks ago).
     function run() external nonReentrant returns (uint256 coinBurned) {
         if (block.timestamp < lastRun + COOLDOWN) revert TooSoon();
+        if (refBlock == 0 || block.number <= refBlock || block.number - refBlock > REF_MAX_AGE) revert NoReference();
         hook.claim();
         uint256 amount = jig.balanceOf(address(this));
         if (amount > maxPerRun) amount = maxPerRun;
         if (amount == 0) revert Nothing();
-        lastRun = uint64(block.timestamp);
         uint256 before = coin.balanceOf(address(this));
         uint256 spent = abi.decode(poolManager.unlock(abi.encode(amount)), (uint256));
+        if (spent == 0) revert Nothing(); // no liquidity inside the bound: do not burn the cooldown
+        lastRun = uint64(block.timestamp);
         coinBurned = coin.balanceOf(address(this)) - before;
         if (coinBurned > 0) coin.burn(coinBurned);
         burned += coinBurned;
@@ -81,11 +97,16 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         uint256 amount = abi.decode(data, (uint256));
         bool zeroForOne = !coinIs0; // JIG in, coin out
-        (uint160 sqrtP,,,) = poolManager.getSlot0(key.toId());
+        (uint160 spot,,,) = poolManager.getSlot0(key.toId());
+        // Bound against the lagged reference: a same-block pump cannot widen it. zeroForOne pushes the price down,
+        // so the base is the higher of the two; oneForZero pushes it up, so the base is the lower.
+        uint160 base = zeroForOne ? (spot > refSqrtPriceX96 ? spot : refSqrtPriceX96) : (spot < refSqrtPriceX96 ? spot : refSqrtPriceX96);
         // sqrt price moves by about half the price move: 3% price => ~1.5% sqrt price
         uint160 limit = zeroForOne
-            ? uint160((uint256(sqrtP) * (10_000 - MAX_IMPACT_BPS / 2)) / 10_000)
-            : uint160((uint256(sqrtP) * (10_000 + MAX_IMPACT_BPS / 2)) / 10_000);
+            ? uint160((uint256(base) * (10_000 - MAX_IMPACT_BPS / 2)) / 10_000)
+            : uint160((uint256(base) * (10_000 + MAX_IMPACT_BPS / 2)) / 10_000);
+        // if the spot is already past the bound, fill nothing rather than revert the manager
+        if (zeroForOne ? spot <= limit : spot >= limit) return abi.encode(uint256(0));
         if (limit <= TickMath.MIN_SQRT_PRICE) limit = TickMath.MIN_SQRT_PRICE + 1;
         if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
         BalanceDelta d = poolManager.swap(key, SwapParams({zeroForOne: zeroForOne, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}), "");

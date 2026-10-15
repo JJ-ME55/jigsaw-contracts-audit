@@ -28,6 +28,7 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     uint64 public constant SET_DELAY = 24 hours;
 
     address public immutable pot;
+    address public factory; // set once by the owner; the only caller of notify()
     uint64 public constant UNSET_WINDOW = 180 days;
     mapping(address coin => Drop) public drops;
     mapping(address coin => uint64) public receivedAt; // when the factory delivered a coin's share
@@ -46,6 +47,8 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     error AlreadyClaimed();
     error BadProof();
     error NotUnset();
+    error NotFactory();
+    error FactorySet();
     error NotYet();
 
     constructor(address owner_, address pot_) Ownable(owner_) {
@@ -53,8 +56,15 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
         pot = pot_;
     }
 
-    /// @notice Called by the factory when a coin's share arrives; anyone may call, it only records the first time.
+    /// @notice Bind the coin factory. Once only.
+    function setFactory(address factory_) external onlyOwner {
+        if (factory != address(0) || factory_ == address(0)) revert FactorySet();
+        factory = factory_;
+    }
+
+    /// @notice Called by the factory when a coin's share arrives, starting the unset-drop clock.
     function notify(address coin) external {
+        if (msg.sender != factory) revert NotFactory();
         if (receivedAt[coin] == 0) receivedAt[coin] = uint64(block.timestamp);
     }
 

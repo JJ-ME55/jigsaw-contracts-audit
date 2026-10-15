@@ -10,6 +10,8 @@ import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
 import {CreatorCoin} from "../src/CreatorCoin.sol";
 import {HolderDrip} from "../src/HolderDrip.sol";
+import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
+import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
@@ -189,6 +191,61 @@ contract RegressionsForkTest is Test {
         vm.stopPrank();
         vm.expectRevert(PotVault.NotYet.selector);
         pot.claim(id, owner, 1e18, new bytes32[](0));
+    }
+
+    // HIGH (second pass): claimFor could strand the drip's slice
+    function test_claimFor_cannot_strand_the_drip() public {
+        HolderDrip drip = new HolderDrip(address(hook), address(nft));
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
+        vm.warp(block.timestamp + 10 minutes);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        uint256 slice = hook.claimable(address(drip));
+        hook.claimFor(address(drip)); // attacker pushes it first
+        assertEq(drip.undistributed(), slice);
+        drip.pull();
+        assertEq(drip.undistributed(), 0);
+        assertApproxEqAbs(drip.owed(1) * 4, slice, 4, "the pushed slice is distributed");
+    }
+
+    // HIGH (second pass): checkpoint accumulator must not truncate
+    function test_large_accumulator_does_not_reopen_overclaim() public {
+        HolderDrip drip = new HolderDrip(address(hook), address(nft));
+        _launchCoin(creator, address(drip));
+        // simulate a very large drip: 4 tokens, 5,000 JIG per token => acc = 5e21 * 1e18 > 2^128
+        vm.prank(buyer);
+        jig.transfer(address(drip), 20_000e18);
+        drip.pull();
+        assertGt(drip.accPerToken(), uint256(type(uint128).max));
+        nft.mint(late, 1); // id 5 after the pull
+        assertEq(drip.owed(5), 0, "late token earns nothing");
+        assertApproxEqAbs(drip.owed(1), 5_000e18, 4);
+    }
+
+    // MEDIUM (second pass): a same-block pump cannot widen the buyback bound
+    function test_buyback_bound_uses_lagged_reference_revert_path() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 minutes);
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), key, 1_000_000e18);
+        vm.prank(buyer);
+        jig.transfer(address(bb), 20_000e18);
+        bb.observe();
+        vm.roll(vm.getBlockNumber() + 1);
+        _swap(buyer, key, !coinIs0, -300_000e18, "");
+        vm.expectRevert(BuybackAndBurn.Nothing.selector);
+        bb.run();
+        assertEq(bb.lastRun(), 0, "cooldown not burned by a zero fill");
+    }
+
+    // LOW (second pass): only the factory can start the airdrop clock
+    function test_airdrop_notify_only_from_factory() public {
+        AirdropClaim ac = new AirdropClaim(platform, address(pot));
+        vm.expectRevert(AirdropClaim.NotFactory.selector);
+        ac.notify(address(0x1234));
+        vm.prank(platform);
+        ac.setFactory(address(factory));
+        vm.prank(address(factory));
+        ac.notify(address(0x1234));
+        assertGt(ac.receivedAt(address(0x1234)), 0);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

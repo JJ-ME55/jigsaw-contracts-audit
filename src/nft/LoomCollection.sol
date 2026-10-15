@@ -80,7 +80,7 @@ contract LoomCollection is
     event UnrevealedURISet(string unrevealedURI);
 
     constructor(address platform, address reserve, address referrers) {
-        if (platform == address(0) || reserve == address(0) || referrers == address(0)) revert ZeroAddress();
+        if (platform == address(0) || reserve == address(0) || referrers == address(0) || referrers.code.length == 0) revert ZeroAddress();
         PLATFORM = platform;
         RESERVE = reserve;
         REFERRERS = referrers;

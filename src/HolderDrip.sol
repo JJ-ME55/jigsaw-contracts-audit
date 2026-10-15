@@ -19,9 +19,12 @@ interface IERC721Supply is IERC721 {
 ///         Paid in JIG, which is what the fee hook holds. Each pull is a checkpoint:
 ///         {supply at the pull, accumulator before it}. A token only earns from pulls
 ///         made while it existed. The collection must mint sequential ids from 1 and
-///         never decrease totalSupply (LoomCollection does both), so "existed at pull k"
-///         is simply id <= supply_k. Tokens sent to the dead address can be marked burned
-///         so later pulls split among live tokens only; their past accrual sweeps to the pot.
+///         never decrease totalSupply (LoomCollection does both). Tokens sent to the dead
+///         address can be marked burned so later pulls split among live tokens only; their
+///         past accrual sweeps to the pot.
+///
+///         Accounting is by balance, not by what claim() returns: anything that lands here
+///         (claim, claimFor, a plain transfer) is distributed on the next pull.
 contract HolderDrip is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -29,8 +32,8 @@ contract HolderDrip is ReentrancyGuard {
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     struct Checkpoint {
-        uint128 supply; // totalSupply at the pull
-        uint128 accBefore; // accPerToken before the pull was added
+        uint96 supply; // totalSupply at the pull
+        uint160 accBefore; // accPerToken before the pull was added; 2^160 > max possible (1e27 * 1e18)
     }
 
     CreatorFeeHook public immutable hook;
@@ -39,7 +42,8 @@ contract HolderDrip is ReentrancyGuard {
     address public immutable pot;
 
     uint256 public accPerToken; // JIG accrued per live NFT, scaled by ACC
-    uint256 public undistributed; // JIG pulled while live supply was 0
+    uint256 public accounted; // JIG ever distributed into accPerToken
+    uint256 public paidOut; // JIG ever paid to holders or swept to the pot
     uint256 public burnedCount;
     Checkpoint[] public checkpoints;
     mapping(uint256 tokenId => uint256) private _paidPerToken;
@@ -62,15 +66,21 @@ contract HolderDrip is ReentrancyGuard {
         collection = IERC721Supply(collection_);
     }
 
-    /// @notice Pull this module's claimable JIG from the hook and spread it over the live supply. Anyone may call.
+    /// @notice JIG held that has not yet been distributed into the accumulator.
+    function undistributed() public view returns (uint256) {
+        return jig.balanceOf(address(this)) - (accounted - paidOut);
+    }
+
+    /// @notice Pull this module's claimable JIG from the hook and spread everything undistributed over the live supply. Anyone may call.
     function pull() external nonReentrant returns (uint256 amount) {
-        amount = hook.claim() + undistributed;
-        undistributed = 0;
+        hook.claim();
+        amount = undistributed();
         uint256 supply = collection.totalSupply();
         uint256 live = supply - burnedCount;
-        if (live == 0 || amount == 0) { undistributed = amount; return amount; }
-        checkpoints.push(Checkpoint({supply: uint128(supply), accBefore: uint128(accPerToken)}));
+        if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
+        checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));
         accPerToken += (amount * ACC) / live;
+        accounted += amount;
         emit Pulled(amount, live);
     }
 
@@ -102,7 +112,10 @@ contract HolderDrip is ReentrancyGuard {
             _paidPerToken[id] = accPerToken;
             _seen[id] = true;
         }
-        if (total > 0) jig.safeTransfer(msg.sender, total);
+        if (total > 0) {
+            paidOut += total;
+            jig.safeTransfer(msg.sender, total);
+        }
         emit Claimed(msg.sender, tokenIds.length, total);
     }
 
@@ -116,7 +129,10 @@ contract HolderDrip is ReentrancyGuard {
         _paidPerToken[tokenId] = accPerToken;
         _seen[tokenId] = true;
         burnedCount++;
-        if (stranded > 0) jig.safeTransfer(pot, stranded);
+        if (stranded > 0) {
+            paidOut += stranded;
+            jig.safeTransfer(pot, stranded);
+        }
         emit MarkedBurned(tokenId, stranded);
     }
 

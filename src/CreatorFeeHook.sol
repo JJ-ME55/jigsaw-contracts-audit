@@ -100,6 +100,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error HookNotImplemented();
 
     constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_, address referrers_) {
+        if (referrers_ == address(0) || referrers_.code.length == 0) revert BadPool();
         referrers = IReferrerRegistry(referrers_);
         poolManager = IPoolManager(poolManager_);
         jig = IERC20(jig_);

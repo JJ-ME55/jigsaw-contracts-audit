@@ -83,6 +83,8 @@ contract FlywheelsForkTest is Test {
         factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(airdrop), 0.01 ether);
         vm.prank(owner);
         hook.setFactory(address(factory));
+        vm.prank(platform);
+        airdrop.setFactory(address(factory));
 
         nft = new MockNFT(creator);
         nft.mint(holderA, 3);
@@ -129,6 +131,7 @@ contract FlywheelsForkTest is Test {
         assertGt(slice, 0);
         drip.pull();
         assertEq(jig.balanceOf(address(drip)), slice);
+        assertEq(drip.undistributed(), 0);
         // 5 tokens: A has 3, B has 1, seller 1
         assertApproxEqAbs(drip.owed(1), slice / 5, 5);
         uint256[] memory a = new uint256[](3); a[0] = 1; a[1] = 2; a[2] = 3;
@@ -188,7 +191,12 @@ contract FlywheelsForkTest is Test {
         vm.prank(creator);
         sab.setMarket(address(market), true);
 
-        // sell all of the module's JIG for ETH, buy token 5 at 0.001 ETH, burn it
+        // sell all of the module's JIG for ETH, buy token 5, burn it; the price reference comes from an earlier block
+        vm.prank(platform);
+        vm.expectRevert(SweepAndBurn.NoReference.selector);
+        sab.sweep(address(market), abi.encodeCall(MockMarket.buy, ()), 5, 1e10, budget);
+        sab.observe();
+        vm.roll(vm.getBlockNumber() + 1);
         vm.prank(platform);
         sab.sweep(address(market), abi.encodeCall(MockMarket.buy, ()), 5, 1e10, budget);
         assertEq(nft.ownerOf(5), sab.DEAD(), "burned");
@@ -227,6 +235,10 @@ contract FlywheelsForkTest is Test {
         vm.prank(creator);
         jig.transfer(address(bb), creatorSlice);
         uint256 supplyBefore = bb.coin().totalSupply();
+        vm.expectRevert(BuybackAndBurn.NoReference.selector);
+        bb.run();
+        bb.observe();
+        vm.roll(vm.getBlockNumber() + 1);
         uint256 burnedCoin = bb.run();
         assertGt(burnedCoin, 0);
         assertEq(bb.coin().totalSupply(), supplyBefore - burnedCoin, "coin supply shrank");
@@ -235,6 +247,8 @@ contract FlywheelsForkTest is Test {
         vm.expectRevert(BuybackAndBurn.TooSoon.selector);
         bb.run();
         vm.warp(block.timestamp + 11 minutes);
+        bb.observe();
+        vm.roll(vm.getBlockNumber() + 1);
         vm.expectRevert(BuybackAndBurn.Nothing.selector);
         bb.run();
     }
@@ -246,6 +260,8 @@ contract FlywheelsForkTest is Test {
         // hand it JIG as if it were its slice
         vm.prank(buyer);
         jig.transfer(address(deep), 1_000_000e18);
+        deep.observe();
+        vm.roll(vm.getBlockNumber() + 1);
         deep.run();
         uint256 id = deep.tokenId();
         assertGt(id, 0);
@@ -260,6 +276,8 @@ contract FlywheelsForkTest is Test {
         vm.expectRevert(LPDeepening.TooSoon.selector);
         deep.run();
         vm.warp(block.timestamp + 11 minutes);
+        deep.observe();
+        vm.roll(vm.getBlockNumber() + 1);
         deep.run();
         assertEq(deep.tokenId(), id, "same position");
         assertGt(IPositionManager(POSM).getPositionLiquidity(id), liq1, "liquidity grew");

@@ -6,6 +6,7 @@ import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
+import {AirdropClaim} from "../src/AirdropClaim.sol";
 
 /// Phase 2 deploy: the shared CreatorFeeHook and the CoinFactory, bound to an existing JIG set.
 ///
@@ -40,6 +41,10 @@ contract DeployCoins is Script {
         require(address(hook) == predicted, "hook address mismatch");
         CoinFactory factory = new CoinFactory(posm, permit2, address(hook), vesting, jig, platform, airdrop, launchFee);
         hook.setFactory(address(factory));
+        if (airdrop != pot) {
+            // bind the AirdropClaim to this factory so only it can start unset-drop clocks (owner must be the deployer)
+            try AirdropClaim(airdrop).setFactory(address(factory)) {} catch { console.log("WARN: AirdropClaim.setFactory failed; the owner must call it"); }
+        }
         vm.stopBroadcast();
 
         console.log("chain          ", block.chainid);

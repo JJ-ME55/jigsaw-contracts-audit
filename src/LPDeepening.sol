@@ -44,6 +44,10 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     uint256 public constant MAX_IMPACT_BPS = 300; // 3% price move per run on the JIG/ETH pool
     uint256 public immutable maxPerRun;
     uint64 public lastRun;
+    /// @dev Reference price recorded in an earlier block, so a caller cannot set the bound in the same tx.
+    uint160 public refSqrtPriceX96;
+    uint64 public refBlock;
+    uint64 public constant REF_MAX_AGE = 256; // blocks
 
     int24 public immutable tickLower;
     int24 public immutable tickUpper;
@@ -58,6 +62,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     error ZeroAddress();
     error Nothing();
     error TooSoon();
+    error NoReference();
 
     constructor(address hook_, address posm_, address permit2_, PoolKey memory jigPool_, uint256 maxPerRun_) {
         if (hook_ == address(0) || posm_ == address(0) || permit2_ == address(0) || maxPerRun_ == 0) revert ZeroAddress();
@@ -74,17 +79,27 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         tickUpper = (TickMath.MAX_TICK / spacing) * spacing;
     }
 
-    /// @notice Pull the slice, sell half for ETH, add both to the locked full-range position. Anyone may call.
+    /// @notice Record the JIG/ETH pool price for a later run. Must be called in an earlier block than run().
+    function observe() external {
+        (uint160 sqrtP,,,) = poolManager.getSlot0(jigPool.toId());
+        refSqrtPriceX96 = sqrtP;
+        refBlock = uint64(block.number);
+    }
+
+    /// @notice Pull the slice, sell half for ETH, add both to the locked full-range position. Anyone may call;
+    ///         needs observe() from an earlier block (at most REF_MAX_AGE blocks ago).
     function run() external nonReentrant {
         if (block.timestamp < lastRun + COOLDOWN) revert TooSoon();
+        if (refBlock == 0 || block.number <= refBlock || block.number - refBlock > REF_MAX_AGE) revert NoReference();
         hook.claim();
         uint256 amount = jig.balanceOf(address(this));
         if (amount > maxPerRun) amount = maxPerRun;
         if (amount == 0) revert Nothing();
-        lastRun = uint64(block.timestamp);
         uint256 half = amount / 2;
         uint256 ethBefore = address(this).balance;
-        poolManager.unlock(abi.encode(half));
+        uint256 sold = abi.decode(poolManager.unlock(abi.encode(half)), (uint256));
+        if (sold == 0) revert Nothing(); // nothing inside the bound: do not burn the cooldown
+        lastRun = uint64(block.timestamp);
         uint256 ethGot = address(this).balance - ethBefore;
         uint256 jigLeft = amount - half; // only this run's other half goes in; the rest waits
 
@@ -135,9 +150,11 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         uint256 amount = abi.decode(data, (uint256));
-        (uint160 sqrtP,,,) = poolManager.getSlot0(jigPool.toId());
-        uint160 limit = uint160((uint256(sqrtP) * (10_000 + MAX_IMPACT_BPS / 2)) / 10_000);
+        (uint160 spot,,,) = poolManager.getSlot0(jigPool.toId());
+        uint160 base = spot < refSqrtPriceX96 ? spot : refSqrtPriceX96; // selling JIG pushes the price up
+        uint160 limit = uint160((uint256(base) * (10_000 + MAX_IMPACT_BPS / 2)) / 10_000);
         if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
+        if (spot >= limit) return abi.encode(uint256(0));
         BalanceDelta d = poolManager.swap(
             jigPool, SwapParams({zeroForOne: false, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}), ""
         );

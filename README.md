@@ -2,7 +2,7 @@
 
 Foundry project. Spec: `../ECONOMICS-DRAFT.md` (signed off 15 Oct 2026) and the JIG build spec v1 both founders signed the same day. Phase 1 is built and live on Sepolia. Nothing is on mainnet.
 
-## Live on Sepolia: fourth deploy, 15 Oct 2026, after the adversarial review below
+## Live on Sepolia: fifth deploy, 15 Oct 2026, after the two review passes below (the JIG set is from the fourth)
 
 ### Phase 1
 
@@ -85,7 +85,20 @@ Before the swarm round, three independent reviewers (our own, each writing Found
 | Low | Vesting schedules near the uint64 limit could brick | checked in create |
 | Low | The first JIG buy was 1.4% off the stated start price | start price set exactly at the range top |
 
-Residual trust, by design: the sweep keeper can still buy its own listing at up to the cap (there is no on-chain floor); tx.origin allowlisting can be relayed by a friend for strangers; third parties can LP into the JIG pool and share its fees with the pot; the hook's nested coin-to-JIG sale is at the post-trade price with no slippage bound (small amounts, the Zora pattern). The 10-minute windows rely on the sequencer's clock on an L2. ETH is assumed native (currency0 == address(0)) everywhere; a chain with a custom gas token needs changes.
+Second pass, over the fixes themselves:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| High | Anyone could strand HolderDrip's income by pushing its balance to it with claimFor before it pulled; the drip only counted what its own claim returned | accounting by balance: everything held and not yet distributed is spread on the next pull |
+| High | HolderDrip's checkpoint stored the accumulator in 128 bits; past about 340 JIG per token it truncated and reopened the over-claim | 160-bit field, enough for the maximum possible value |
+| Medium | The 3% price bound was measured against the spot price, which the caller sets in the same transaction, so it capped our own impact rather than a sandwich | observe() records a reference in an earlier block; run() bounds against the worse of reference and spot, so a same-block pump fills nothing |
+| Medium | SweepAndBurn's JIG sale had no bound at all, and held ETH let a bad swap pass the price check | same lagged bound; the swap in a sweep must itself cover the price |
+| Low | A zero-fill run burned the cooldown | a run that fills nothing reverts and leaves the cooldown alone |
+| Low | Anyone could start the airdrop's 180-day unset clock early for a predicted coin address | only the bound factory can notify |
+
+Operational note: BuybackAndBurn, LPDeepening and SweepAndBurn now need `observe()` in an earlier block (within 256 blocks) before `run()` or `sweep()`. The back end's keeper does both.
+
+Residual trust, by design: the sweep keeper can still buy its own listing at up to the cap (there is no on-chain floor); tx.origin allowlisting can be relayed by a friend for strangers; third parties can LP into the JIG pool and share its fees with the pot; the hook's nested coin-to-JIG sale is at the post-trade price with no slippage bound (small amounts, the Zora pattern); someone who holds a manipulated price across a block can still move a module's reference by up to the bound. The 10-minute windows rely on the sequencer's clock on an L2. ETH is assumed native (currency0 == address(0)) everywhere; a chain with a custom gas token needs changes. HolderDrip requires a collection with sequential ids from 1 whose totalSupply never decreases (LoomCollection).
 
 ## Audit status
 
@@ -93,7 +106,7 @@ Residual trust, by design: the sweep keeper can still buy its own listing at up 
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening, ReferrerRegistry, LoomCollection v2 | Claude, 15 Oct, with 51 passing tests (19 unit, 32 on a Sepolia fork) plus the adversarial review above. LoomCollection/LoomFactory were swarm-written and swarm-audited at launch 1746; v2 adds the referral | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening, ReferrerRegistry, LoomCollection v2 | Claude, 15 Oct, with 55 passing tests (19 unit, 36 on a Sepolia fork) plus the two adversarial review passes above. LoomCollection/LoomFactory were swarm-written and swarm-audited at launch 1746; v2 adds the referral | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
@@ -101,17 +114,17 @@ Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREA
 
 | Contract | Address | What it does |
 |---|---|---|
-| CreatorFeeHook | `0x9c1Eeb0cF35684E642096AF01e5c14c3d0a4E044` | the one shared hook for every creator coin. Takes the creator's fee (1 to 10%, lower-only) from every swap's unspecified currency; if that is the coin it sells it for JIG in the same transaction; credits creator / flywheel / launch referral / trade referral / platform / pot / deepening as claimable JIG. Anti-snipe: 60% decaying to the chosen fee over the first 10 minutes. Address flag bits 0x2044 |
-| CoinFactory | `0x7F5210C95B00e4cF7De6f9d448021099Af4A1a90` | one call launches a coin: 1B fixed supply, coin/JIG pool (LP fee 0) on the hook, 90% seeded single-sided, LP NFT held by the factory forever, 5% creator vesting (6 months), 5% airdrop share, 0.01 ETH launch fee to platform |
+| CreatorFeeHook | `0x23D705710304Eb83985a22f72531A810851b6044` | the one shared hook for every creator coin. Takes the creator's fee (1 to 10%, lower-only) from every swap's unspecified currency; if that is the coin it sells it for JIG in the same transaction; credits creator / flywheel / launch referral / trade referral / platform / pot / deepening as claimable JIG. Anti-snipe: 60% decaying to the chosen fee over the first 10 minutes. Address flag bits 0x2044 |
+| CoinFactory | `0xF154ff6a08408cC4EB244e27551c4Aa9dD277111` | one call launches a coin: 1B fixed supply, coin/JIG pool (LP fee 0) on the hook, 90% seeded single-sided, LP NFT held by the factory forever, 5% creator vesting (6 months), 5% airdrop share, 0.01 ETH launch fee to platform |
 | CreatorCoin | deployed per launch | fixed-supply ERC-20 with the collection address baked in, burnable |
-| AirdropClaim | `0xFD9Ed4b5F9Cb808C86c14de584c862120De31F5C` | shared merkle claim for every coin's 5% airdrop; the factory parks each coin's 5% here; platform sets one root per coin from a holder snapshot with a window; leftovers sweep to the pot; the owner can never send tokens anywhere else |
+| AirdropClaim | `0xD8E74BBf9F8A923d9100D1215a4dAAd283B2E1B3` | shared merkle claim for every coin's 5% airdrop; the factory parks each coin's 5% here; platform sets one root per coin from a holder snapshot with a window; leftovers sweep to the pot; the owner can never send tokens anywhere else |
 | HolderDrip | one per coin, deployed by the back end before launch and passed as `flywheel` | pulls the flywheel slice from the hook and accrues it per NFT; holders claim in JIG for the tokens they own |
 | SweepAndBurn | one per coin, same | pulls the flywheel slice, sells JIG for ETH on the JIG/ETH pool, pays a marketplace order the platform keeper supplies, checks the NFT arrived, sends it to the dead address. A max price caps what the keeper may spend per sweep |
 | BuybackAndBurn | one per coin, same | pulls the flywheel slice, buys the coin on its own pool, burns it. Anyone can trigger |
-| LPDeepening | `0xB90AE207cB3FEeb923BDaA5f44A551450144f652` | shared. The deepening slice of every coin fee: sells half for ETH on the JIG/ETH pool and adds both as full-range liquidity to a position it holds forever. LP fees it earns go to the pot. Bound to the hook once via `setDeepening` |
+| LPDeepening | `0x56f9d292C1054112BcfbB27515EF681CE6436a8a` | shared. The deepening slice of every coin fee: sells half for ETH on the JIG/ETH pool and adds both as full-range liquidity to a position it holds forever. LP fees it earns go to the pot. Bound to the hook once via `setDeepening` |
 | ReferrerRegistry | `0x7a0939052a4686c4EA59CD6136B7041FE4d7abd2` | platform-owned list of approved referral recipients (front ends). Unapproved referrals earn nothing; used by the fee hook and NFT v2 |
-| LoomCollection v2 | `0xE84af3734cf7f716151a2e11223A02ac5f052abf` | the audited collection (swarm launch 1746) plus `mint(quantity, referral)`: 10 of the platform's 40 points go to an approved referring site. `mint(quantity)` unchanged. Reserve address is the pot |
-| LoomFactory v2 | `0x70360D914e89Cd37e31Cf955B90a700b9C62253C` | unchanged factory over the v2 implementation. The back end's `SEPOLIA_FACTORY` can switch to it when Fish is ready; the old factory keeps working |
+| LoomCollection v2 | `0xD7CEa7A6447685f80E6b138afe2eE40e36A8bfFC` | the audited collection (swarm launch 1746) plus `mint(quantity, referral)`: 10 of the platform's 40 points go to an approved referring site. `mint(quantity)` unchanged. Reserve address is the pot |
+| LoomFactory v2 | `0xa8D9A85b297B49d6c6B3D9Af65314Ae20EFb635a` | unchanged factory over the v2 implementation. The back end's `SEPOLIA_FACTORY` can switch to it when Fish is ready; the old factory keeps working |
 
 Fee split, in basis points of the fee: flywheel 2000, launch referral 1000, trade referral 1000, pot 300, deepening 200, platform 1500 / 2000 / 2500 / 3000 by fee band (1% / 2-3% / 4-6% / 7-10%), creator the remainder. Referrals default to platform. The trade referral is the address passed as `hookData` with the swap (the front end passes its own address).
 
@@ -125,7 +138,7 @@ Design notes an auditor should know:
 - **The early max-wallet from the spec is not built.** The decaying 60% fee is the anti-snipe measure.
 - **hook.setFactory is one-shot**, because the hook and factory reference each other.
 
-Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop and sweep end to end; `NftV2` covers the referral and fee conservation. 51 tests in all, including RegressionsFork. on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
+Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop and sweep end to end; `NftV2` covers the referral and fee conservation. 55 tests in all, including RegressionsFork. on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
 
 Deploy: `script/DeployCoins.s.sol` (hook + factory, CREATE2-mined; `SALT_SEED` to redeploy with identical args), `script/DeployRest.s.sol` (AirdropClaim, NFT v2) and `script/DeployDeepening.s.sol` (LPDeepening + binding), all driven by env vars.
 
