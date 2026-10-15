@@ -59,7 +59,7 @@ contract CreatorCoinForkTest is Test {
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xBEEF) << 20));
         deployCodeTo(
             "CreatorFeeHook.sol:CreatorFeeHook",
-            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(pot)),
+            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)),
             hookAddr
         );
         hook = CreatorFeeHook(hookAddr);

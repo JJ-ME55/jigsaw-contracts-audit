@@ -70,7 +70,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     address public factory; // set once by the owner after the factory is deployed (hook and factory reference each other)
     address public immutable platform;
     address public immutable pot;
-    address public immutable deepening; // LP-deepening module, or the pot until it exists
+    address public deepening; // LP-deepening module; the pot until setDeepening() binds it (once)
 
     mapping(PoolId => Config) public pools;
     mapping(address => uint256) public claimable; // JIG owed, by recipient
@@ -80,6 +80,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     event PoolRegistered(PoolId indexed id, address indexed coin, address indexed creator, uint24 feePips, address flywheel, address launchReferral);
     event FeeLowered(PoolId indexed id, uint24 feePips);
     event FactorySet_(address factory);
+    event DeepeningSet_(address deepening);
     event FeeTaken(PoolId indexed id, address indexed tradeReferral, uint256 jigAmount, uint24 feePips);
     event Claimed(address indexed to, uint256 amount);
 
@@ -87,6 +88,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error NotFactory();
     error NotOwner();
     error FactorySet();
+    error DeepeningSet();
     error NotCreator();
     error NotRegistered();
     error AlreadyRegistered();
@@ -94,13 +96,13 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error BadFee();
     error HookNotImplemented();
 
-    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_, address deepening_) {
+    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
         poolManager = IPoolManager(poolManager_);
         jig = IERC20(jig_);
         owner = owner_;
         platform = platform_;
         pot = pot_;
-        deepening = deepening_;
+        deepening = pot_;
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
@@ -124,6 +126,14 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     // ---------------- registration ----------------
+
+    /// @notice Bind the LP-deepening module. Once only; until then the slice accrues to the pot.
+    function setDeepening(address deepening_) external {
+        if (msg.sender != owner) revert NotOwner();
+        if (deepening != pot || deepening_ == address(0)) revert DeepeningSet();
+        deepening = deepening_;
+        emit DeepeningSet_(deepening_);
+    }
 
     /// @notice Bind the factory. Once only.
     function setFactory(address factory_) external {

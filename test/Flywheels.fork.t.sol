@@ -12,6 +12,9 @@ import {CreatorCoin} from "../src/CreatorCoin.sol";
 import {HolderDrip} from "../src/HolderDrip.sol";
 import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {SweepAndBurn} from "../src/SweepAndBurn.sol";
+import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
+import {LPDeepening} from "../src/LPDeepening.sol";
+import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -71,7 +74,7 @@ contract FlywheelsForkTest is Test {
         jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 10_000, tickSpacing: 200, hooks: IHooks(address(0))});
 
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xF1F1) << 20));
-        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(pot)), hookAddr);
+        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         airdrop = new AirdropClaim(platform, address(pot));
         factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(airdrop), 0.01 ether);
@@ -190,6 +193,55 @@ contract FlywheelsForkTest is Test {
         vm.prank(platform);
         vm.expectRevert(SweepAndBurn.OverMaxPrice.selector);
         sab.sweep(address(market), "", 5, 2e12, 1);
+    }
+
+    // ---------- BuybackAndBurn ----------
+
+    function test_buyback_and_burn() public {
+        // the module needs the pool key, which exists only after launch: launch with flywheel = creator, then
+        // deploy the module and lower nothing; instead test the module on a second coin launched with it.
+        // Simplest: predict nothing, launch with a placeholder, then launch again with the real module.
+        (, PoolKey memory k0, bool c0) = _launchCoin(address(0));
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), k0);
+        // the flywheel for coin 0 was the creator (address(0) => creator). Give the module JIG directly instead.
+        _buyCoin(k0, c0, 100_000e18);
+        uint256 creatorSlice = hook.claimable(creator);
+        vm.prank(creator);
+        hook.claim();
+        vm.prank(creator);
+        jig.transfer(address(bb), creatorSlice);
+        uint256 supplyBefore = bb.coin().totalSupply();
+        uint256 burnedCoin = bb.run();
+        assertGt(burnedCoin, 0);
+        assertEq(bb.coin().totalSupply(), supplyBefore - burnedCoin, "coin supply shrank");
+        assertEq(bb.burned(), burnedCoin);
+        assertEq(jig.balanceOf(address(bb)), 0, "all JIG spent");
+        vm.expectRevert(BuybackAndBurn.Nothing.selector);
+        bb.run();
+    }
+
+    // ---------- LPDeepening ----------
+
+    function test_lp_deepening_adds_locked_liquidity() public {
+        LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey);
+        // hand it JIG as if it were its slice
+        vm.prank(buyer);
+        jig.transfer(address(deep), 1_000_000e18);
+        deep.run();
+        uint256 id = deep.tokenId();
+        assertGt(id, 0);
+        assertEq(IPositionManager(POSM).getPositionLiquidity(id) > 0, true);
+        assertGt(deep.totalEthAdded(), 0);
+        assertGt(deep.totalJigAdded(), 0);
+        assertLt(jig.balanceOf(address(deep)), 1_000_000e18 / 100, "almost all JIG used");
+        uint128 liq1 = IPositionManager(POSM).getPositionLiquidity(id);
+        // second run increases the same position
+        vm.prank(buyer);
+        jig.transfer(address(deep), 500_000e18);
+        deep.run();
+        assertEq(deep.tokenId(), id, "same position");
+        assertGt(IPositionManager(POSM).getPositionLiquidity(id), liq1, "liquidity grew");
+        deep.collectFees(); // no revert, fees (if any) go to the pot
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

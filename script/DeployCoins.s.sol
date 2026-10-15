@@ -9,7 +9,7 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 /// Phase 2 deploy: the shared CreatorFeeHook and the CoinFactory, bound to an existing JIG set.
 ///
 /// Sepolia only. Reads LAUNCH_PK (deployer = hook owner), JIG, POT, VESTING, optional PLATFORM
-/// (default deployer), DEEPENING (default POT), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
+/// (default deployer), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
 ///
 ///   set -a; . ../backend/.env; set +a
 ///   JIG=0x... POT=0x... VESTING=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
@@ -27,15 +27,14 @@ contract DeployCoins is Script {
         address pot = vm.envAddress("POT");
         address vesting = vm.envAddress("VESTING");
         address platform = vm.envOr("PLATFORM", deployer);
-        address deepening = vm.envOr("DEEPENING", pot);
         address airdrop = vm.envOr("AIRDROP", pot);
         uint256 launchFee = vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
 
-        bytes memory args = abi.encode(poolManager, jig, deployer, platform, pot, deepening);
+        bytes memory args = abi.encode(poolManager, jig, deployer, platform, pot);
         (address predicted, bytes32 salt) = _mine(type(CreatorFeeHook).creationCode, args);
 
         vm.startBroadcast(pk);
-        CreatorFeeHook hook = new CreatorFeeHook{salt: salt}(poolManager, jig, deployer, platform, pot, deepening);
+        CreatorFeeHook hook = new CreatorFeeHook{salt: salt}(poolManager, jig, deployer, platform, pot);
         require(address(hook) == predicted, "hook address mismatch");
         CoinFactory factory = new CoinFactory(posm, permit2, address(hook), vesting, jig, platform, airdrop, launchFee);
         hook.setFactory(address(factory));
