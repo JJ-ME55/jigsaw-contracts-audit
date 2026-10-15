@@ -2,17 +2,17 @@
 
 Foundry project. Spec: `../ECONOMICS-DRAFT.md` (signed off 15 Oct 2026) and the JIG build spec v1 both founders signed the same day. Phase 1 is built and live on Sepolia. Nothing is on mainnet.
 
-## Live on Sepolia: ninth deploy, 15 Oct 2026, after the third review pass
+## Live on Sepolia: tenth deploy, 15 Oct 2026, after the checklist audit
 
 ### Phase 1
 
 | Contract | Address | What it does |
 |---|---|---|
-| JIG | `0x82AA96D239543B8b1dCC9BD510643aEF6cCA8203` | fixed 1,000,000,000 supply, minted once: 90% to JIGLaunch, 10% to PotVault. No mint, no tax, no owner. Burnable |
-| JIGLaunch | `0x84f1CD194ACab038cbE059D6386E1A585633ba7a` | created the JIG/ETH v4 pool, seeded it single-sided with 900M JIG, holds the LP NFT forever. No transfer or remove-liquidity function. `collectFees()` splits LP fees half to the team wallet, half to the pot; anyone can call |
-| PotVault | `0xdb994C6965BABC73a1366C11068c4aDc23A7bB37` | the JIG pot. Holds 100M JIG now; receives mint reserve ETH and hook slices later. Payouts are merkle claims and are switched off until `enablePayouts()` (one-way, owner only). Owner cannot withdraw |
-| Vesting | `0x59BA8E126d8239d95805a7ac088b563acFF30720` | linear vesting with cliff for any ERC-20, irrevocable. Deployed but unused since creator vesting was dropped (15 Oct) |
-| JIGLaunchHook | `0xCfDA0C0107dfe82D53A057F3FBBBc271FA75E080` | the launch window: for 10 minutes after the pool opened, allowlisted tx.origin pays 1%, anyone else 60%, then 1% for all. Serves only the ETH/JIG dynamic-fee pool at the agreed spacing and start price, and only JIGLaunch may initialise it. CREATE2-mined address (flag bits 0x2080). This Sepolia deploy has no allowlist (everyone paid 60% in its window) |
+| JIG | `0x1AdE8C9d615F0759f514296b0c5fAc3cbA8208e5` | fixed 1,000,000,000 supply, minted once: 90% to JIGLaunch, 10% to PotVault. No mint, no tax, no owner. Burnable |
+| JIGLaunch | `0xDA126B2d1832441ae8Ec299E354CEbC9fdaF2DB7` | created the JIG/ETH v4 pool, seeded it single-sided with 900M JIG, holds the LP NFT forever. No transfer or remove-liquidity function. `collectFees()` splits LP fees half to the team wallet, half to the pot; anyone can call |
+| PotVault | `0xB5fC9C6d23a335Af2aaF2bBd494daC5cE5e36E1c` | the JIG pot. Holds 100M JIG now; receives mint reserve ETH and hook slices later. Payouts are merkle claims and are switched off until `enablePayouts()` (one-way, owner only). Owner cannot withdraw |
+| Vesting | `0xE7e4af17814089FCe521f2d77317f7B208DDA81b` | linear vesting with cliff for any ERC-20, irrevocable. Deployed but unused since creator vesting was dropped (15 Oct) |
+| JIGLaunchHook | `0xE380546e55bfe9eb01041316656eBFcd2C65e080` | the launch window: for 10 minutes after the pool opened, allowlisted tx.origin pays 1%, anyone else 60%, then 1% for all. Serves only the ETH/JIG dynamic-fee pool at the agreed spacing and start price, and only JIGLaunch may initialise it. CREATE2-mined address (flag bits 0x2080). This Sepolia deploy has no allowlist (everyone paid 60% in its window) |
 
 Pool on Sepolia: ETH / JIG, dynamic fee via the hook, tick spacing 200, launched 15 Oct 2026 with the agreed parameters below. Earlier Sepolia sets are superseded and can be ignored.
 
@@ -114,13 +114,28 @@ Operational note: BuybackAndBurn, LPDeepening and SweepAndBurn are keeper-only. 
 
 Residual trust, by design: the sweep keeper can still buy its own listing at up to the cap (there is no on-chain floor); tx.origin allowlisting can be relayed by a friend for strangers; third parties can LP into the JIG pool and share its fees with the pot; the hook's nested coin-to-JIG sale is at the post-trade price with no slippage bound (small amounts, the Zora pattern); a keeper's run can be front-run in the mempool up to the minimum-out tolerance it passes. The 10-minute windows rely on the sequencer's clock on an L2. ETH is assumed native (currency0 == address(0)) everywhere; a chain with a custom gas token needs changes. HolderDrip requires a collection with sequential ids from 1 whose totalSupply never decreases (LoomCollection).
 
+## Checklist audit, 15 Oct 2026
+
+After the three adversarial passes, a 370-item checklist audit (Solodit-derived categories: attacker's mindset, basics, heuristics, DeFi, tokens, integrations, external calls, merkle, centralisation, cross-chain, signatures) was run over the whole base. Full report: `audit-report.md`. 370 items walked, 154 applicable, no Critical or High; every earlier fix verified to hold. What it found and what changed:
+
+| Severity | Finding | Fix |
+|---|---|---|
+| Medium | The platform wallet is `owner()` of every site-launched collection (the NFT factory makes the launcher the owner), so it could launch any artist's coin first and be its creator forever | the coin factory checks `creator()` first and only falls back to `owner()` for collections without a creator field |
+| Medium | One hot key holds every privileged role | operational: the 2-of-2 founders' multisig (DRIFT item 10, Jj) before mainnet |
+| Low | Unspent dev-buy JIG stranded in the factory on a partial fill | refunded to the creator in the same transaction |
+| Low | Keeper-only modules with no permissionless pull could have their slice recycled after 7 quiet days | `pull()` on BuybackAndBurn and LPDeepening, anyone may call |
+| Low | The airdrop notify call was unchecked, so a mis-bound AirdropClaim would silently never start its clock | the factory requires a contract recipient to accept the notification |
+| Low | `PotVault.available()` looped over every distribution ever declared | a reserved counter; `settle(id)` releases an expired distribution's remainder |
+| Low | The keeper can sandwich its own runs, and deepening adds liquidity at the post-sale spot | accepted: the keeper is the platform; bounded by the hook fee and the keeper's minimum out |
+| Low | The 7-day airdrop sweep races the owner setting the root | operational: the back end sets drops within 7 days |
+
 ## Audit status
 
 **Plan of record, 15 Oct 2026 (Jj):** build the whole contract base on Sepolia first, no audits during the build. Then push the contracts to a throwaway public repo, have the IMD swarm audit the full base from it (the swarm cannot read a private repo and refuses requests with source embedded), fix findings, re-audit, launch nothing, delete the throwaway repo after sign-off. A single 0.5 IMD job can carry several agents, so the brief asks for two independent reviews of the repo inside the job, with the output a compiled list of each reviewer's findings and fixes. When everything has passed, tell Fish the back end is ready and go to mainnet in one sequence: JIG, then the NFT factory, then the creator-coin side. Then make the repo private again. External audit deferred; the fee hook and factory carry every coin's money, so that stays the main open risk.
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 53 passing tests (14 unit, 39 on a Sepolia fork) plus the three adversarial review passes above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 53 passing tests (14 unit, 39 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
@@ -128,16 +143,16 @@ Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREA
 
 | Contract | Address | What it does |
 |---|---|---|
-| CreatorFeeHook | `0xF595D6c999e7855893e9650A95Fd3E86d93D2044` | the one shared hook for every creator coin. Takes the creator's fee (1 to 10%, lower-only) from every swap's unspecified currency; if that is the coin it sells it for JIG in the same transaction; credits creator / flywheel / platform / pot / deepening as claimable JIG. Anti-snipe: 60% decaying to the chosen fee over the first 10 seconds. Address flag bits 0x2044 |
-| CoinFactory | `0x902a58Ac33e93a0f95EDc0738397310C82a1FA8f` | one call launches a coin: 1B fixed supply, coin/JIG pool (LP fee 0) on the hook, seeded single-sided, LP NFT held by the factory forever, 5% airdrop share, 0 to 5% to the creator's wallet (their choice) and an optional dev buy with JIG in the same transaction, launch fee in ETH settable by the platform |
+| CreatorFeeHook | `0xCf6fD7d7220a57d8Ab748910ad57FAE41E7D2044` | the one shared hook for every creator coin. Takes the creator's fee (1 to 10%, lower-only) from every swap's unspecified currency; if that is the coin it sells it for JIG in the same transaction; credits creator / flywheel / platform / pot / deepening as claimable JIG. Anti-snipe: 60% decaying to the chosen fee over the first 10 seconds. Address flag bits 0x2044 |
+| CoinFactory | `0x4da5775EFBd24ba928023EE18c645d76EB56518b` | one call launches a coin: 1B fixed supply, coin/JIG pool (LP fee 0) on the hook, seeded single-sided, LP NFT held by the factory forever, 5% airdrop share, 0 to 5% to the creator's wallet (their choice) and an optional dev buy with JIG in the same transaction, launch fee in ETH settable by the platform |
 | CreatorCoin | deployed per launch | fixed-supply ERC-20 with the collection address baked in, burnable |
-| AirdropClaim | `0xF8Daaa2D5120F4131E4a3dAf8f24e383dD23E09d` | shared merkle claim for every coin's 5% airdrop; the factory parks each coin's 5% here; platform sets one root per coin from a holder snapshot with a window; leftovers sweep to the pot, as does a share with no drop set within 7 days; there is no withdraw |
+| AirdropClaim | `0xAbEa696D8E26a995D63fde07736a2Bd0579BB9e4` | shared merkle claim for every coin's 5% airdrop; the factory parks each coin's 5% here; platform sets one root per coin from a holder snapshot with a window; leftovers sweep to the pot, as does a share with no drop set within 7 days; there is no withdraw |
 | HolderDrip | one per coin, deployed by the back end before launch and passed as `flywheel` | pulls the flywheel slice from the hook and accrues it per NFT; holders claim in JIG for the tokens they own. Anyone may pull |
 | SweepAndBurn | one per coin, same | keeper-only: sells JIG for ETH on the JIG/ETH pool with a keeper-supplied minimum out, pays an approved marketplace order, checks the NFT arrived, sends it to the dead address. The creator approves marketplaces and sets the price cap |
 | BuybackAndBurn | one per collection, same | keeper-only, at random times the back end picks: buys the collection's coin (resolved from the factory) on its own pool with the whole balance (keeper-supplied minimum out), burns it |
-| HolderPayouts | `0x965a81fA58F5E25cCfDc2a4e710311Ee8C84C4C7` | shared. Snapshot rounds for the "fees to coin holders" and "split NFT and coin holders" flywheels: a per-coin SnapshotForwarder delivers the slice here; the platform snapshots holders at a random moment and declares a round (merkle root, total, 7-day window); holders claim; unclaimed returns to the coin's balance for the next round. No withdraw. No staking anywhere (Jj, 15 Oct) |
+| HolderPayouts | `0x1387B7ac318C148301CE53A45543D900aD9DAd94` | shared. Snapshot rounds for the "fees to coin holders" and "split NFT and coin holders" flywheels: a per-coin SnapshotForwarder delivers the slice here; the platform snapshots holders at a random moment and declares a round (merkle root, total, 7-day window); holders claim; unclaimed returns to the coin's balance for the next round. No withdraw. No staking anywhere (Jj, 15 Oct) |
 | SnapshotForwarder | one per collection, passed as `flywheel` | pulls the slice from the hook and funds HolderPayouts under the collection's coin, resolved from the factory. Anyone may pull |
-| LPDeepening | `0x0076D864CF0Fc9a65F077cA95984658Bea20AD13` | shared, keeper-only. The deepening slice of every coin fee: sells half for ETH on the JIG/ETH pool (keeper-supplied minimum out) and adds both as full-range liquidity to a position it holds forever. LP fees it earns go to the pot. Bound to the hook once via `setDeepening` |
+| LPDeepening | `0xEa0CbF235d605dA314c995701cDbfDe70EBEAC45` | shared, keeper-only. The deepening slice of every coin fee: sells half for ETH on the JIG/ETH pool (keeper-supplied minimum out) and adds both as full-range liquidity to a position it holds forever. LP fees it earns go to the pot. Bound to the hook once via `setDeepening` |
 
 Fee split, in basis points of the fee: pot 300 and deepening 200 fixed; platform 2500 / 3000 / 3500 / 4000 by fee band (1% / 2-3% / 4-6% / 7-10%); the rest (7000 / 6500 / 6000 / 5500) is the creator+flywheel block, which the creator divides with `setCreatorShare` (default flywheel 2000, creator the remainder). A creator's or flywheel's balance untouched for 7 days can be folded back through the same split by anyone (`recycle`). Anti-snipe on creator coins: 60% decaying to the chosen fee over 10 seconds.
 

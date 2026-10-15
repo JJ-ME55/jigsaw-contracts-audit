@@ -69,6 +69,11 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
         return Currency.unwrap(key().currency0) != address(jig);
     }
 
+    /// @notice Pull this module's slice from the hook into its balance. Anyone may call, so the balance can never go stale.
+    function pull() external nonReentrant returns (uint256 amount) {
+        amount = hook.claim();
+    }
+
     /// @notice Pull the slice from the hook, buy the coin with all of it, burn what arrives.
     /// @param minCoinOut the least coin the keeper will accept for the whole balance (off-chain quote minus tolerance)
     function run(uint256 minCoinOut) external nonReentrant returns (uint256 coinBurned) {

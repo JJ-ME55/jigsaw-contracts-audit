@@ -7,6 +7,7 @@ import {PotVault} from "../src/PotVault.sol";
 import {Vesting} from "../src/Vesting.sol";
 import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
+import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {CreatorCoin} from "../src/CreatorCoin.sol";
 
 contract OwnedCollection {
@@ -43,6 +44,7 @@ contract CreatorCoinForkTest is Test {
     JIG jig;
     CreatorFeeHook hook;
     CoinFactory factory;
+    AirdropClaim airdrop;
     PoolSwapTest swapper;
     CreatorCoin coin;
     PoolKey key;
@@ -65,7 +67,10 @@ contract CreatorCoinForkTest is Test {
             hookAddr
         );
         hook = CreatorFeeHook(hookAddr);
-        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(pot), 0.01 ether);
+        airdrop = new AirdropClaim(platform, address(pot));
+        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(airdrop), 0.01 ether);
+        vm.prank(platform);
+        airdrop.setFactory(address(factory));
         vm.prank(owner);
         hook.setFactory(address(factory));
 
@@ -127,7 +132,7 @@ contract CreatorCoinForkTest is Test {
     function test_launch_distributes_supply_and_locks_lp() public {
         _launch(10_000);
         assertEq(coin.totalSupply(), 1_000_000_000e18);
-        assertEq(coin.balanceOf(address(pot)), 50_000_000e18, "airdrop share parked in the pot until AirdropClaim exists");
+        assertEq(coin.balanceOf(address(airdrop)), 50_000_000e18, "airdrop share delivered to AirdropClaim");
         assertEq(coin.balanceOf(creator), 0, "no creator allocation unless asked");
         assertLt(coin.balanceOf(address(factory)), 1e18, "pool share seeded");
         (,,, uint256 tokenId,) = factory.launches(0);

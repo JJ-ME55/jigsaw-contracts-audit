@@ -155,7 +155,8 @@ contract JIGTest is Test {
         vm.warp(block.timestamp + 31 days);
         vm.expectRevert(PotVault.Expired.selector);
         pot.claim(id, bob, 40e18, bad);
-        assertEq(pot.available(address(jig)), 100_000_000e18 - 60e18, "unclaimed returns to the pot");
+        pot.settle(id);
+        assertEq(pot.available(address(jig)), 100_000_000e18 - 60e18, "unclaimed returns to the pot after settle");
     }
 
     function test_pot_declare_cannot_exceed_available() public {

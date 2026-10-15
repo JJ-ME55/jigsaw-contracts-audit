@@ -76,6 +76,11 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         tickUpper = (TickMath.MAX_TICK / spacing) * spacing;
     }
 
+    /// @notice Pull this module's slice from the hook into its balance. Anyone may call.
+    function pull() external nonReentrant returns (uint256 amount) {
+        amount = hook.claim();
+    }
+
     /// @notice Pull the slice, sell half for ETH, add both to the locked full-range position. Keeper only.
     /// @param minEthOut the least ETH the keeper will accept for the half it sells (off-chain quote minus tolerance)
     function run(uint256 minEthOut) external nonReentrant {

@@ -19,6 +19,10 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {CreatorCoin} from "./CreatorCoin.sol";
 import {CreatorFeeHook} from "./CreatorFeeHook.sol";
 
+interface IAirdropNotify {
+    function notify(address coin) external;
+}
+
 /// @title CoinFactory
 /// @notice Launches a creator coin for a collection (Build Spec §4, revised 15 Oct). One call:
 ///         deploys the coin (fixed 1B supply), creates the coin/JIG v4 pool on the shared
@@ -138,8 +142,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
         if (creatorTokens > 0) IERC20(coinAddr).safeTransfer(msg.sender, creatorTokens);
         IERC20(coinAddr).safeTransfer(airdropRecipient, AIRDROP_SHARE);
-        (bool noted,) = airdropRecipient.call(abi.encodeWithSignature("notify(address)", coinAddr));
-        noted;
+        if (airdropRecipient.code.length > 0) IAirdropNotify(airdropRecipient).notify(coinAddr); // a contract recipient must accept the clock
 
         uint256 devBuyCoin;
         if (p.devBuyJig > 0) devBuyCoin = _devBuy(key, coinIs0, coinAddr, p.devBuyJig, p.devBuyMinCoin);
@@ -172,6 +175,8 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         got = abi.decode(poolManager.unlock(abi.encode(key, coinIs0, jigIn)), (uint256));
         if (got < minOut || got == 0) revert TooLittleOut();
         IERC20(coinAddr).safeTransfer(msg.sender, got);
+        uint256 left = jig.balanceOf(address(this));
+        if (left > 0) jig.safeTransfer(msg.sender, left); // a partial fill refunds the unspent JIG
     }
 
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
@@ -198,12 +203,14 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         return abi.encode(got);
     }
 
-    /// @dev The caller must be the collection's owner() or creator() (both exist on LoomCollection).
+    /// @dev The caller must be the collection's creator(). Only a collection with no creator() falls back to owner():
+    ///      on LoomCollection the owner is whoever launched it, which is the platform's wallet for site-launched
+    ///      collections, and the platform must not be able to claim an artist's coin.
     function _controlsCollection(address who, address collection) internal view returns (bool) {
-        (bool ok, bytes memory ret) = collection.staticcall(abi.encodeWithSignature("owner()"));
-        if (ok && ret.length == 32 && abi.decode(ret, (address)) == who) return true;
-        (ok, ret) = collection.staticcall(abi.encodeWithSignature("creator()"));
-        if (ok && ret.length == 32 && abi.decode(ret, (address)) == who) return true;
+        (bool ok, bytes memory ret) = collection.staticcall(abi.encodeWithSignature("creator()"));
+        if (ok && ret.length == 32) return abi.decode(ret, (address)) == who;
+        (ok, ret) = collection.staticcall(abi.encodeWithSignature("owner()"));
+        if (ok && ret.length == 32) return abi.decode(ret, (address)) == who;
         return false;
     }
 

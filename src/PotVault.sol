@@ -24,10 +24,12 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
         uint128 total;
         uint128 claimed;
         uint64 expiry; // after this, unclaimed stays in the vault for a later distribution
+        bool settled; // expired remainder released back to available()
     }
 
     bool public payoutsEnabled;
     Distribution[] public distributions;
+    mapping(address token => uint256) public reserved; // live distributions' unclaimed totals
     mapping(uint256 id => mapping(address account => bool)) public hasClaimed;
 
     event Received(address indexed from, address indexed token, uint256 amount);
@@ -66,7 +68,8 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
         if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp) revert BadDistribution();
         if (total > available(token)) revert BadDistribution();
         id = distributions.length;
-        distributions.push(Distribution({token: token, root: root, total: uint128(total), claimed: 0, expiry: expiry}));
+        distributions.push(Distribution({token: token, root: root, total: uint128(total), claimed: 0, expiry: expiry, settled: false}));
+        reserved[token] += total;
         emit DistributionDeclared(id, token, root, total, expiry);
     }
 
@@ -80,6 +83,7 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
 
         hasClaimed[id][account] = true;
         d.claimed += uint128(amount);
+        reserved[d.token] -= amount;
         emit Claimed(id, account, amount);
 
         if (d.token == address(0)) {
@@ -90,15 +94,21 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// @notice Balance of `token` not yet reserved by a live distribution.
+    /// @notice After a distribution's window, release what was not claimed back to available(). Anyone may call.
+    function settle(uint256 id) external returns (uint256 released) {
+        Distribution storage d = distributions[id];
+        if (block.timestamp <= d.expiry) revert BadDistribution();
+        if (d.settled) return 0;
+        d.settled = true;
+        released = d.total - d.claimed;
+        reserved[d.token] -= released;
+    }
+
+    /// @notice Balance of `token` not reserved by a live or unsettled distribution.
     function available(address token) public view returns (uint256) {
         uint256 bal = token == address(0) ? address(this).balance : IERC20(token).balanceOf(address(this));
-        uint256 reserved;
-        for (uint256 i; i < distributions.length; i++) {
-            Distribution storage d = distributions[i];
-            if (d.token == token && block.timestamp <= d.expiry) reserved += d.total - d.claimed;
-        }
-        return bal > reserved ? bal - reserved : 0;
+        uint256 r = reserved[token];
+        return bal > r ? bal - r : 0;
     }
 
     function distributionCount() external view returns (uint256) {

@@ -23,6 +23,11 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
+contract CreatorNFT {
+    address public owner; address public creator;
+    constructor(address o, address c) { owner = o; creator = c; }
+}
+
 contract OwnedNFT is ERC721 {
     uint256 public totalSupply;
     address public owner;
@@ -46,6 +51,8 @@ contract RegressionsForkTest is Test {
     address holderA = makeAddr("holderA");
     address late = makeAddr("late");
 
+    AirdropClaim airdrop;
+
     PotVault pot; JIG jig; Vesting vesting; JIGLaunch launch; CreatorFeeHook hook; CoinFactory factory;
     OwnedNFT nft; PoolSwapTest swapper; PoolKey jigKey;
 
@@ -63,7 +70,10 @@ contract RegressionsForkTest is Test {
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xC0DE) << 20));
         deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
-        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(pot), 0.01 ether);
+        airdrop = new AirdropClaim(platform, address(pot));
+        factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(jig), platform, address(airdrop), 0.01 ether);
+        vm.prank(platform);
+        airdrop.setFactory(address(factory));
         vm.prank(owner);
         hook.setFactory(address(factory));
         nft = new OwnedNFT(creator);
@@ -105,6 +115,12 @@ contract RegressionsForkTest is Test {
         factory.launch{value: 0.01 ether}(_params(makeAddr("eoa"), 10_000, address(0), 1 << 96, -200, 0));
         _launchCoin(creator, address(0));
         assertEq(factory.count(), 1);
+        // a collection with a creator() field: only the creator may launch, even if the platform is owner()
+        CreatorNFT cn = new CreatorNFT(platform, creator);
+        vm.deal(platform, 1 ether);
+        vm.prank(platform);
+        vm.expectRevert(CoinFactory.NotCollectionOwner.selector);
+        factory.launch{value: 0.01 ether}(_params(address(cn), 10_000, address(0), 1 << 96, -200, 0));
     }
 
     // HIGH: pot could never claim
