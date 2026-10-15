@@ -9,6 +9,7 @@ import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+import {IReferrerRegistry} from "../ReferrerRegistry.sol";
 
 /// @title LoomCollection
 /// @notice Fixed ERC-721 logic for EIP-1167 clones. Each clone has its own owner and configuration.
@@ -31,6 +32,8 @@ contract LoomCollection is
 
     address public immutable PLATFORM;
     address public immutable RESERVE;
+    /// @notice v2: approved referral recipients; an unapproved referral earns nothing and the platform keeps its 40.
+    address public immutable REFERRERS;
 
     address public creator;
     uint256 public maxSupply;
@@ -76,10 +79,11 @@ contract LoomCollection is
     event BaseURISet(string baseURI);
     event UnrevealedURISet(string unrevealedURI);
 
-    constructor(address platform, address reserve) {
-        if (platform == address(0) || reserve == address(0)) revert ZeroAddress();
+    constructor(address platform, address reserve, address referrers) {
+        if (platform == address(0) || reserve == address(0) || referrers == address(0)) revert ZeroAddress();
         PLATFORM = platform;
         RESERVE = reserve;
+        REFERRERS = referrers;
         _disableInitializers();
     }
 
@@ -229,7 +233,7 @@ contract LoomCollection is
         uint256 platformAmount = PLATFORM_FEE_SHARE * quantity;
         uint256 reserveAmount = RESERVE_FEE_SHARE * quantity;
         uint256 referralAmount;
-        if (referral != address(0) && referral != PLATFORM) {
+        if (referral != address(0) && referral != PLATFORM && IReferrerRegistry(REFERRERS).isReferrer(referral)) {
             referralAmount = REFERRAL_FEE_SHARE * quantity;
             platformAmount -= referralAmount;
         }

@@ -28,8 +28,8 @@ contract JIGLaunchForkTest is Test {
     // Launch parameters (see script/DeployJIG.s.sol for the reasoning)
     uint24 constant FEE = 10_000; // 1%
     int24 constant TICK_SPACING = 200;
-    uint160 constant SQRT_PRICE = 1980704062856608439838598758400000; // sqrt(6.25e8) * 2^96: 1 ETH = 625,000,000 JIG, $4k FDV at $2,500 ETH
-    int24 constant TICK_UPPER = 202_400; // just below the start tick (~202,542)
+    int24 constant TICK_UPPER = 202_400;
+    uint160 SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER); // start price at the range top
     int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     address owner = makeAddr("owner");
@@ -97,7 +97,7 @@ contract JIGLaunchForkTest is Test {
         );
         uint256 got = jig.balanceOf(buyer);
         assertGt(got, 300_000_000e18, "hundreds of millions of JIG for the first 1 ETH at a $4k start");
-        assertLt(got, 625_000_000e18);
+        assertLt(got, 616_000_000e18);
 
         uint256 potBefore = address(pot).balance;
         launch.collectFees();

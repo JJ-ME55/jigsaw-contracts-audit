@@ -25,7 +25,8 @@ import {CreatorFeeHook} from "./CreatorFeeHook.sol";
 ///         sells half for ETH on the JIG/ETH pool, and adds both as full-range liquidity
 ///         to a position this contract holds forever. There is no function to remove
 ///         liquidity or transfer the position. LP fees it earns are collected to the pot.
-///         Shared: one instance, bound to the hook as `deepening`.
+///         Shared: one instance, bound to the hook as `deepening`. MEV limits: at most
+///         maxPerRun JIG per run, one run per COOLDOWN, price move capped at ~3%.
 contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
     using StateLibrary for IPoolManager;
@@ -39,6 +40,11 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     address public immutable pot;
     PoolKey public jigPool; // ETH / JIG
 
+    uint64 public constant COOLDOWN = 10 minutes;
+    uint256 public constant MAX_IMPACT_BPS = 300; // 3% price move per run on the JIG/ETH pool
+    uint256 public immutable maxPerRun;
+    uint64 public lastRun;
+
     int24 public immutable tickLower;
     int24 public immutable tickUpper;
     uint256 public tokenId; // 0 until the first deepening
@@ -51,9 +57,11 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     error NotPoolManager();
     error ZeroAddress();
     error Nothing();
+    error TooSoon();
 
-    constructor(address hook_, address posm_, address permit2_, PoolKey memory jigPool_) {
-        if (hook_ == address(0) || posm_ == address(0) || permit2_ == address(0)) revert ZeroAddress();
+    constructor(address hook_, address posm_, address permit2_, PoolKey memory jigPool_, uint256 maxPerRun_) {
+        if (hook_ == address(0) || posm_ == address(0) || permit2_ == address(0) || maxPerRun_ == 0) revert ZeroAddress();
+        maxPerRun = maxPerRun_;
         hook = CreatorFeeHook(hook_);
         jig = hook.jig();
         poolManager = hook.poolManager();
@@ -68,13 +76,17 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
 
     /// @notice Pull the slice, sell half for ETH, add both to the locked full-range position. Anyone may call.
     function run() external nonReentrant {
-        uint256 amount = hook.claim() + jig.balanceOf(address(this));
+        if (block.timestamp < lastRun + COOLDOWN) revert TooSoon();
+        hook.claim();
+        uint256 amount = jig.balanceOf(address(this));
+        if (amount > maxPerRun) amount = maxPerRun;
         if (amount == 0) revert Nothing();
+        lastRun = uint64(block.timestamp);
         uint256 half = amount / 2;
         uint256 ethBefore = address(this).balance;
         poolManager.unlock(abi.encode(half));
         uint256 ethGot = address(this).balance - ethBefore;
-        uint256 jigLeft = jig.balanceOf(address(this));
+        uint256 jigLeft = amount - half; // only this run's other half goes in; the rest waits
 
         (uint160 sqrtP,,,) = poolManager.getSlot0(jigPool.toId());
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
@@ -105,6 +117,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         totalEthAdded += ethAdded;
         totalJigAdded += jigAdded;
         emit Deepened(half, ethGot, jigAdded, ethAdded, liquidity);
+        // jigLeft not consumed by the position stays in the module for the next run
     }
 
     /// @notice Collect the position's LP fees to the pot. Liquidity is untouched.
@@ -122,14 +135,21 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         uint256 amount = abi.decode(data, (uint256));
+        (uint160 sqrtP,,,) = poolManager.getSlot0(jigPool.toId());
+        uint160 limit = uint160((uint256(sqrtP) * (10_000 + MAX_IMPACT_BPS / 2)) / 10_000);
+        if (limit >= TickMath.MAX_SQRT_PRICE) limit = TickMath.MAX_SQRT_PRICE - 1;
         BalanceDelta d = poolManager.swap(
-            jigPool, SwapParams({zeroForOne: false, amountSpecified: -int256(amount), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1}), ""
+            jigPool, SwapParams({zeroForOne: false, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}), ""
         );
-        poolManager.sync(jigPool.currency1);
-        jig.safeTransfer(address(poolManager), uint256(uint128(-d.amount1())));
-        poolManager.settle();
-        poolManager.take(jigPool.currency0, address(this), uint256(uint128(d.amount0())));
-        return "";
+        uint256 sold = uint256(uint128(-d.amount1()));
+        if (sold > 0) {
+            poolManager.sync(jigPool.currency1);
+            jig.safeTransfer(address(poolManager), sold);
+            poolManager.settle();
+        }
+        uint256 got = uint256(uint128(d.amount0()));
+        if (got > 0) poolManager.take(jigPool.currency0, address(this), got);
+        return abi.encode(sold);
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

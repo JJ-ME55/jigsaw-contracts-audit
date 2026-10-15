@@ -138,6 +138,9 @@ contract JIGTest is Test {
         uint256 id = pot.declare(address(jig), root, 100e18, uint64(block.timestamp + 30 days));
         vm.stopPrank();
         assertEq(pot.available(address(jig)), 100_000_000e18 - 100e18, "reserved while live");
+        vm.expectRevert(PotVault.NotYet.selector);
+        pot.claim(id, alice, 60e18, new bytes32[](0));
+        vm.warp(block.timestamp + 48 hours);
 
         bytes32[] memory proofA = new bytes32[](1);
         proofA[0] = lb;

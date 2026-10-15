@@ -23,8 +23,8 @@ contract JIGLaunchHookForkTest is Test {
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     int24 constant TICK_SPACING = 200;
-    uint160 constant SQRT_PRICE = 1980704062856608439838598758400000; // $4k start
     int24 constant TICK_UPPER = 202_400;
+    uint160 SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER);
     int24 constant TICK_LOWER = -887_200;
 
     address owner = makeAddr("owner");
@@ -52,7 +52,7 @@ contract JIGLaunchHookForkTest is Test {
 
         // Put the hook at an address with exactly the right flag bits.
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCD) << 20));
-        deployCodeTo("JIGLaunchHook.sol:JIGLaunchHook", abi.encode(POOL_MANAGER, address(jig), launcher), hookAddr);
+        deployCodeTo("JIGLaunchHook.sol:JIGLaunchHook", abi.encode(POOL_MANAGER, address(jig), launcher, address(launch), SQRT_PRICE, TICK_SPACING), hookAddr);
         hook = JIGLaunchHook(hookAddr);
 
         leafFriend = keccak256(bytes.concat(keccak256(abi.encode(friend))));
@@ -128,6 +128,17 @@ contract JIGLaunchHookForkTest is Test {
         vm.prank(launcher);
         vm.expectRevert(JIGLaunchHook.AlreadyInitialized.selector);
         hook.setAllowlist(bytes32(uint256(1)));
+    }
+
+    function test_nobody_else_can_initialise_or_front_run() public {
+        // a fresh hook bound to this launch: a stranger cannot open the pool first
+        address h2 = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCE) << 20));
+        deployCodeTo("JIGLaunchHook.sol:JIGLaunchHook", abi.encode(POOL_MANAGER, address(jig), launcher, address(launch), SQRT_PRICE, TICK_SPACING), h2);
+        PoolKey memory k = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: LPFeeLibrary.DYNAMIC_FEE_FLAG, tickSpacing: TICK_SPACING, hooks: IHooks(h2)});
+        vm.prank(sniper);
+        vm.expectRevert();
+        IPoolManager(POOL_MANAGER).initialize(k, SQRT_PRICE);
+        assertFalse(JIGLaunchHook(h2).initialized());
     }
 
     function test_hook_refuses_other_pools() public {

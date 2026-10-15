@@ -15,6 +15,7 @@ import {SweepAndBurn} from "../src/SweepAndBurn.sol";
 import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
 import {LPDeepening} from "../src/LPDeepening.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
+import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -28,7 +29,8 @@ import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 
 contract MockNFT is ERC721 {
     uint256 public totalSupply;
-    constructor() ERC721("Mock", "MOCK") {}
+    address public owner;
+    constructor(address o) ERC721("Mock", "MOCK") { owner = o; }
     function mint(address to, uint256 n) external { for (uint256 i; i < n; i++) _mint(to, ++totalSupply); }
 }
 
@@ -58,7 +60,7 @@ contract FlywheelsForkTest is Test {
     address seller = makeAddr("seller");
 
     PotVault pot; JIG jig; Vesting vesting; JIGLaunch launch; CreatorFeeHook hook; CoinFactory factory;
-    AirdropClaim airdrop; MockNFT nft; PoolSwapTest swapper; PoolKey jigKey;
+    AirdropClaim airdrop; MockNFT nft; PoolSwapTest swapper; PoolKey jigKey; ReferrerRegistry registry;
 
     function setUp() public {
         vm.createSelectFork("sepolia");
@@ -69,19 +71,20 @@ contract FlywheelsForkTest is Test {
         vm.startPrank(owner);
         launch.setJig(address(jig));
         // hookless JIG/ETH pool, 1%, $4k start, full range
-        launch.launch(10_000, 200, address(0), 1980704062856608439838598758400000, -887_200, 202_400);
+        launch.launch(10_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
         vm.stopPrank();
         jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 10_000, tickSpacing: 200, hooks: IHooks(address(0))});
 
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xF1F1) << 20));
-        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
+        registry = new ReferrerRegistry(platform);
+        deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(registry)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         airdrop = new AirdropClaim(platform, address(pot));
         factory = new CoinFactory(POSM, PERMIT2, hookAddr, address(vesting), address(jig), platform, address(airdrop), 0.01 ether);
         vm.prank(owner);
         hook.setFactory(address(factory));
 
-        nft = new MockNFT();
+        nft = new MockNFT(creator);
         nft.mint(holderA, 3);
         nft.mint(holderB, 1);
         nft.mint(seller, 1); // token 5, the listing
@@ -137,7 +140,7 @@ contract FlywheelsForkTest is Test {
         assertEq(drip.claim(a), 0, "nothing twice");
         uint256[] memory b = new uint256[](1); b[0] = 1;
         vm.prank(holderB);
-        vm.expectRevert("not owner");
+        vm.expectRevert(HolderDrip.NotOwner.selector);
         drip.claim(b);
     }
 
@@ -152,6 +155,9 @@ contract FlywheelsForkTest is Test {
         vm.prank(platform);
         airdrop.setDrop(address(coin), root, 40_000_000e18, uint64(block.timestamp + 30 days));
         bytes32[] memory pa = new bytes32[](1); pa[0] = lb;
+        vm.expectRevert(AirdropClaim.NotYet.selector);
+        airdrop.claim(address(coin), holderA, 30_000_000e18, pa);
+        vm.warp(block.timestamp + 24 hours);
         airdrop.claim(address(coin), holderA, 30_000_000e18, pa);
         assertEq(coin.balanceOf(holderA), 30_000_000e18);
         vm.expectRevert(AirdropClaim.AlreadyClaimed.selector);
@@ -169,7 +175,7 @@ contract FlywheelsForkTest is Test {
     // ---------- SweepAndBurn ----------
 
     function test_sweep_and_burn_buys_and_burns() public {
-        SweepAndBurn sab = new SweepAndBurn(address(hook), address(nft), platform, jigKey, 1e12);
+        SweepAndBurn sab = new SweepAndBurn(address(hook), address(nft), creator, platform, jigKey, 1e12);
         (, PoolKey memory key, bool coinIs0) = _launchCoin(address(sab));
         _buyCoin(key, coinIs0, 500_000e18);
         sab.pull();
@@ -179,6 +185,8 @@ contract FlywheelsForkTest is Test {
         MockMarket market = new MockMarket(IERC721(address(nft)), seller, 5, 1e10); // the module's JIG is small at a $4k start
         vm.prank(seller);
         nft.setApprovalForAll(address(market), true);
+        vm.prank(creator);
+        sab.setMarket(address(market), true);
 
         // sell all of the module's JIG for ETH, buy token 5 at 0.001 ETH, burn it
         vm.prank(platform);
@@ -190,9 +198,17 @@ contract FlywheelsForkTest is Test {
         vm.prank(buyer);
         vm.expectRevert(SweepAndBurn.NotSweeper.selector);
         sab.sweep(address(market), "", 5, 1, 1);
+        vm.warp(block.timestamp + 11 minutes);
         vm.prank(platform);
         vm.expectRevert(SweepAndBurn.OverMaxPrice.selector);
         sab.sweep(address(market), "", 5, 2e12, 1);
+        // the keeper cannot point the module at the JIG token or an unapproved contract
+        vm.prank(platform);
+        vm.expectRevert(SweepAndBurn.MarketNotAllowed.selector);
+        sab.sweep(address(jig), "", 5, 0, 0);
+        vm.prank(creator);
+        vm.expectRevert(SweepAndBurn.MarketNotAllowed.selector);
+        sab.setMarket(address(jig), true);
     }
 
     // ---------- BuybackAndBurn ----------
@@ -202,7 +218,7 @@ contract FlywheelsForkTest is Test {
         // deploy the module and lower nothing; instead test the module on a second coin launched with it.
         // Simplest: predict nothing, launch with a placeholder, then launch again with the real module.
         (, PoolKey memory k0, bool c0) = _launchCoin(address(0));
-        BuybackAndBurn bb = new BuybackAndBurn(address(hook), k0);
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), k0, 1_000_000e18);
         // the flywheel for coin 0 was the creator (address(0) => creator). Give the module JIG directly instead.
         _buyCoin(k0, c0, 100_000e18);
         uint256 creatorSlice = hook.claimable(creator);
@@ -215,7 +231,10 @@ contract FlywheelsForkTest is Test {
         assertGt(burnedCoin, 0);
         assertEq(bb.coin().totalSupply(), supplyBefore - burnedCoin, "coin supply shrank");
         assertEq(bb.burned(), burnedCoin);
-        assertEq(jig.balanceOf(address(bb)), 0, "all JIG spent");
+        assertEq(jig.balanceOf(address(bb)), 0, "all JIG spent within the price cap");
+        vm.expectRevert(BuybackAndBurn.TooSoon.selector);
+        bb.run();
+        vm.warp(block.timestamp + 11 minutes);
         vm.expectRevert(BuybackAndBurn.Nothing.selector);
         bb.run();
     }
@@ -223,7 +242,7 @@ contract FlywheelsForkTest is Test {
     // ---------- LPDeepening ----------
 
     function test_lp_deepening_adds_locked_liquidity() public {
-        LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey);
+        LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey, 10_000_000e18);
         // hand it JIG as if it were its slice
         vm.prank(buyer);
         jig.transfer(address(deep), 1_000_000e18);
@@ -238,6 +257,9 @@ contract FlywheelsForkTest is Test {
         // second run increases the same position
         vm.prank(buyer);
         jig.transfer(address(deep), 500_000e18);
+        vm.expectRevert(LPDeepening.TooSoon.selector);
+        deep.run();
+        vm.warp(block.timestamp + 11 minutes);
         deep.run();
         assertEq(deep.tokenId(), id, "same position");
         assertGt(IPositionManager(POSM).getPositionLiquidity(id), liq1, "liquidity grew");

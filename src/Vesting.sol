@@ -49,6 +49,7 @@ contract Vesting is ReentrancyGuard {
         if (total == 0 || total > type(uint128).max) revert ZeroAmount();
         if (duration == 0 || cliff > duration) revert BadSchedule();
         if (start == 0) start = uint64(block.timestamp);
+        if (uint256(start) + duration > type(uint64).max) revert BadSchedule();
 
         uint256 before = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), total);

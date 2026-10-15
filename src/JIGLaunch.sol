@@ -11,6 +11,9 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 
 /// @title JIGLaunch
 /// @notice One-shot fair launch of the JIG/ETH Uniswap v4 pool (spec 2).
@@ -26,8 +29,11 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 ///         position accrues ETH.
 contract JIGLaunch {
     using SafeERC20 for IERC20;
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     IPositionManager public immutable posm;
+    IPoolManager public immutable poolManager;
     IAllowanceTransfer public immutable permit2;
     address public immutable launcher;
     address public immutable potVault;
@@ -46,10 +52,12 @@ contract JIGLaunch {
     error JigNotSet();
     error RangeNotBelowPrice();
     error ZeroAddress();
+    error PriceMismatch();
 
     constructor(address posm_, address permit2_, address launcher_, address potVault_) {
         if (posm_ == address(0) || permit2_ == address(0) || launcher_ == address(0) || potVault_ == address(0)) revert ZeroAddress();
         posm = IPositionManager(posm_);
+        poolManager = IPositionManager(posm_).poolManager();
         permit2 = IAllowanceTransfer(permit2_);
         launcher = launcher_;
         potVault = potVault_;
@@ -89,7 +97,10 @@ contract JIGLaunch {
             tickSpacing: tickSpacing,
             hooks: IHooks(hooks)
         });
-        posm.initializePool(poolKey, sqrtPriceX96);
+        // Initialise directly so a revert surfaces (PositionManager.initializePool swallows them), then verify.
+        poolManager.initialize(poolKey, sqrtPriceX96);
+        (uint160 actual,,,) = poolManager.getSlot0(poolKey.toId());
+        if (actual != sqrtPriceX96) revert PriceMismatch();
 
         uint256 amount = jig.balanceOf(address(this));
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmount1(

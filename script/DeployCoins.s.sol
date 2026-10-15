@@ -5,11 +5,12 @@ import {Script, console} from "forge-std/Script.sol";
 import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
 
 /// Phase 2 deploy: the shared CreatorFeeHook and the CoinFactory, bound to an existing JIG set.
 ///
 /// Sepolia only. Reads LAUNCH_PK (deployer = hook owner), JIG, POT, VESTING, optional PLATFORM
-/// (default deployer), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
+/// (default deployer), REGISTRY (default: deploy a new ReferrerRegistry owned by PLATFORM), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
 ///
 ///   set -a; . ../backend/.env; set +a
 ///   JIG=0x... POT=0x... VESTING=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
@@ -28,13 +29,14 @@ contract DeployCoins is Script {
         address vesting = vm.envAddress("VESTING");
         address platform = vm.envOr("PLATFORM", deployer);
         address airdrop = vm.envOr("AIRDROP", pot);
+        address registry = vm.envOr("REGISTRY", address(0));
         uint256 launchFee = vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
 
-        bytes memory args = abi.encode(poolManager, jig, deployer, platform, pot);
-        (address predicted, bytes32 salt) = _mine(type(CreatorFeeHook).creationCode, args);
-
         vm.startBroadcast(pk);
-        CreatorFeeHook hook = new CreatorFeeHook{salt: salt}(poolManager, jig, deployer, platform, pot);
+        if (registry == address(0)) registry = address(new ReferrerRegistry(platform));
+        bytes memory args = abi.encode(poolManager, jig, deployer, platform, pot, registry);
+        (address predicted, bytes32 salt) = _mine(type(CreatorFeeHook).creationCode, args);
+        CreatorFeeHook hook = new CreatorFeeHook{salt: salt}(poolManager, jig, deployer, platform, pot, registry);
         require(address(hook) == predicted, "hook address mismatch");
         CoinFactory factory = new CoinFactory(posm, permit2, address(hook), vesting, jig, platform, airdrop, launchFee);
         hook.setFactory(address(factory));
@@ -43,6 +45,7 @@ contract DeployCoins is Script {
         console.log("chain          ", block.chainid);
         console.log("CreatorFeeHook ", address(hook));
         console.log("CoinFactory    ", address(factory));
+        console.log("Registry       ", registry);
         console.log("platform       ", platform);
         console.log("launch fee wei ", launchFee);
     }

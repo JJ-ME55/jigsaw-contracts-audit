@@ -13,7 +13,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///         visible on chain. Payouts exist as merkle distributions but are switched OFF
 ///         until both founders enable them after legal advice (spec 3f). Nothing can
 ///         leave the vault except through a declared distribution, claimed by holders
-///         (pull, never push). The owner cannot withdraw to itself.
+///         (pull, never push). There is no withdraw. The owner authors each tree, so the
+///         owner must be the founders' multisig, and every declaration waits DECLARE_DELAY
+///         before anyone can claim, giving time to check the tree against the snapshot.
 contract PotVault is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -23,7 +25,10 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
         uint128 total;
         uint128 claimed;
         uint64 expiry; // after this, unclaimed stays in the vault for a later distribution
+        uint64 claimableFrom; // declare + DECLARE_DELAY: time to check the published tree against the snapshot
     }
+
+    uint64 public constant DECLARE_DELAY = 48 hours;
 
     bool public payoutsEnabled;
     Distribution[] public distributions;
@@ -40,6 +45,7 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
     error Expired();
     error BadProof();
     error EthSendFailed();
+    error NotYet();
 
     constructor(address owner_) Ownable(owner_) {}
 
@@ -62,15 +68,16 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
     ///         Funds stay in the vault until each holder claims.
     function declare(address token, bytes32 root, uint256 total, uint64 expiry) external onlyOwner returns (uint256 id) {
         if (!payoutsEnabled) revert PayoutsOff();
-        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp) revert BadDistribution();
+        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp + DECLARE_DELAY) revert BadDistribution();
         if (total > available(token)) revert BadDistribution();
         id = distributions.length;
-        distributions.push(Distribution({token: token, root: root, total: uint128(total), claimed: 0, expiry: expiry}));
+        distributions.push(Distribution({token: token, root: root, total: uint128(total), claimed: 0, expiry: expiry, claimableFrom: uint64(block.timestamp) + DECLARE_DELAY}));
         emit DistributionDeclared(id, token, root, total, expiry);
     }
 
     function claim(uint256 id, address account, uint256 amount, bytes32[] calldata proof) external nonReentrant {
         Distribution storage d = distributions[id];
+        if (block.timestamp < d.claimableFrom) revert NotYet();
         if (block.timestamp > d.expiry) revert Expired();
         if (hasClaimed[id][account]) revert AlreadyClaimed();
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));

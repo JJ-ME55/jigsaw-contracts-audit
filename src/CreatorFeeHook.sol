@@ -15,6 +15,7 @@ import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/Pool
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {IReferrerRegistry} from "./ReferrerRegistry.sol";
 
 /// @title CreatorFeeHook
 /// @notice The one shared fee hook for every creator coin (Economics v3 §5, Addendum A, Build Spec §5).
@@ -71,9 +72,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     address public immutable platform;
     address public immutable pot;
     address public deepening; // LP-deepening module; the pot until setDeepening() binds it (once)
+    IReferrerRegistry public immutable referrers; // approved trade-referral recipients; unapproved => platform
 
     mapping(PoolId => Config) public pools;
     mapping(address => uint256) public claimable; // JIG owed, by recipient
+    mapping(PoolId => uint256) public pendingCoin; // coin claims not yet converted (partial fills), per pool
     uint256 public totalClaimable;
     bool private _converting;
 
@@ -96,7 +99,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error BadFee();
     error HookNotImplemented();
 
-    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
+    constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_, address referrers_) {
+        referrers = IReferrerRegistry(referrers_);
         poolManager = IPoolManager(poolManager_);
         jig = IERC20(jig_);
         owner = owner_;
@@ -198,11 +202,21 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     // ---------------- claims ----------------
 
     function claim() external nonReentrant returns (uint256 amount) {
-        amount = claimable[msg.sender];
-        claimable[msg.sender] = 0;
+        return _claim(msg.sender);
+    }
+
+    /// @notice Pay `to` what it is owed. Anyone may call; funds only ever go to the credited address.
+    ///         Needed for recipients that cannot call claim() themselves (PotVault, deepening).
+    function claimFor(address to) external nonReentrant returns (uint256 amount) {
+        return _claim(to);
+    }
+
+    function _claim(address to) internal returns (uint256 amount) {
+        amount = claimable[to];
+        claimable[to] = 0;
         totalClaimable -= amount;
-        if (amount > 0) poolManager.unlock(abi.encode(msg.sender, amount));
-        emit Claimed(msg.sender, amount);
+        if (amount > 0) poolManager.unlock(abi.encode(to, amount));
+        emit Claimed(to, amount);
     }
 
     /// @dev Only reached from claim(): burn JIG claims and send real JIG to the claimant.
@@ -244,7 +258,9 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         int128 unspec = specifiedIs0 ? delta.amount1() : delta.amount0();
         uint256 abs = unspec < 0 ? uint256(uint128(-unspec)) : uint256(uint128(unspec));
         uint24 feePips = currentFee(id);
-        uint256 fee = (abs * feePips) / PIPS;
+        // Exact-input: the unspecified currency is the output, fee = f * output (swapper keeps 1 - f).
+        // Exact-output: the unspecified currency is the input, charged on top; scale so the effective rate matches.
+        uint256 fee = params.amountSpecified < 0 ? (abs * feePips) / PIPS : (abs * feePips) / (PIPS - feePips);
         if (fee == 0) return (IHooks.afterSwap.selector, 0);
 
         // Hold the fee as an ERC-6909 claim inside the PoolManager. No real tokens move until claim(),
@@ -254,16 +270,18 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
 
         uint256 jigAmount = fee;
         bool feeIsCoin = Currency.unwrap(feeCurrency) == c.coin;
-        if (feeIsCoin) jigAmount = _sellCoinForJig(key, c.coinIs0, fee);
+        if (feeIsCoin) jigAmount = _sellCoinForJig(key, id, c.coinIs0, fee);
 
         address tradeRef = hookData.length >= 32 ? abi.decode(hookData, (address)) : address(0);
+        if (tradeRef != address(0) && !referrers.isReferrer(tradeRef)) tradeRef = address(0);
         _split(c, jigAmount, tradeRef);
         emit FeeTaken(id, tradeRef, jigAmount, feePips);
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
 
     /// @dev Sell `amount` of the coin into the same pool for JIG, inside the current unlock.
-    function _sellCoinForJig(PoolKey calldata key, bool coinIs0, uint256 amount) internal returns (uint256 jigOut) {
+    function _sellCoinForJig(PoolKey calldata key, PoolId id, bool coinIs0, uint256 amount) internal returns (uint256 jigOut) {
+        amount += pendingCoin[id]; // retry anything a previous partial fill left behind
         _converting = true;
         BalanceDelta d = poolManager.swap(
             key,
@@ -284,7 +302,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         poolManager.burn(address(this), coin.toId(), owed);
         jigOut = uint256(uint128(jigDelta));
         poolManager.mint(address(this), jigC.toId(), jigOut);
-        // if the pool could not absorb the whole amount, the remainder stays as coin claims (not credited)
+        // if the pool could not absorb the whole amount, the remainder stays as coin claims and is retried next time
+        pendingCoin[id] = amount - owed;
     }
 
     function _split(Config storage c, uint256 amount, address tradeRef) internal {

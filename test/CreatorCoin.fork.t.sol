@@ -8,6 +8,12 @@ import {Vesting} from "../src/Vesting.sol";
 import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 import {CoinFactory} from "../src/CoinFactory.sol";
 import {CreatorCoin} from "../src/CreatorCoin.sol";
+import {ReferrerRegistry} from "../src/ReferrerRegistry.sol";
+
+contract OwnedCollection {
+    address public owner;
+    constructor(address o) { owner = o; }
+}
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -30,7 +36,7 @@ contract CreatorCoinForkTest is Test {
     address owner = makeAddr("owner");
     address platform = makeAddr("platform");
     address creator = makeAddr("creator");
-    address collection = makeAddr("collection");
+    address collection;
     address flywheel = makeAddr("flywheel");
     address launchSite = makeAddr("launchSite");
     address tradeSite = makeAddr("tradeSite");
@@ -41,6 +47,7 @@ contract CreatorCoinForkTest is Test {
     Vesting vesting;
     CreatorFeeHook hook;
     CoinFactory factory;
+    ReferrerRegistry registry;
     PoolSwapTest swapper;
     CreatorCoin coin;
     PoolKey key;
@@ -56,10 +63,16 @@ contract CreatorCoinForkTest is Test {
         jig = new JIG(launchStub, address(pot));
         vesting = new Vesting();
 
+        collection = address(new OwnedCollection(creator));
+        registry = new ReferrerRegistry(platform);
+        vm.startPrank(platform);
+        registry.setReferrer(launchSite, true);
+        registry.setReferrer(tradeSite, true);
+        vm.stopPrank();
         address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xBEEF) << 20));
         deployCodeTo(
             "CreatorFeeHook.sol:CreatorFeeHook",
-            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)),
+            abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot), address(registry)),
             hookAddr
         );
         hook = CreatorFeeHook(hookAddr);

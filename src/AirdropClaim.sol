@@ -11,8 +11,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 /// @notice Shared merkle claim for every creator coin's 5% airdrop to its collection's
 ///         NFT holders (Build Spec §4). CoinFactory sends each coin's 5% here at launch.
 ///         The owner (platform) then sets one root per coin from a holder snapshot, with
-///         a claim window. Leftovers after the window go to the pot. The owner can never
-///         send tokens anywhere except the pot, and only after expiry.
+///         a claim window. Leftovers after the window go to the pot, as does a share whose drop
+///         is never set within 180 days. The owner chooses recipients through the root but has
+///         no withdraw path: tokens only ever go to proven leaves or to the pot.
 contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -21,10 +22,15 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
         uint128 total;
         uint128 claimed;
         uint64 expiry;
+        uint64 claimableFrom; // setDrop + SET_DELAY: time to check the tree against the snapshot
     }
 
+    uint64 public constant SET_DELAY = 24 hours;
+
     address public immutable pot;
+    uint64 public constant UNSET_WINDOW = 180 days;
     mapping(address coin => Drop) public drops;
+    mapping(address coin => uint64) public receivedAt; // when the factory delivered a coin's share
     mapping(address coin => mapping(address account => bool)) public hasClaimed;
 
     event DropSet(address indexed coin, bytes32 root, uint256 total, uint64 expiry);
@@ -39,24 +45,40 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
     error NotExpired();
     error AlreadyClaimed();
     error BadProof();
+    error NotUnset();
+    error NotYet();
 
     constructor(address owner_, address pot_) Ownable(owner_) {
         if (pot_ == address(0)) revert ZeroAddress();
         pot = pot_;
     }
 
+    /// @notice Called by the factory when a coin's share arrives; anyone may call, it only records the first time.
+    function notify(address coin) external {
+        if (receivedAt[coin] == 0) receivedAt[coin] = uint64(block.timestamp);
+    }
+
+    /// @notice If no drop was ever set for `coin` within UNSET_WINDOW of delivery, anyone may send its share to the pot.
+    function sweepUnset(address coin) external nonReentrant returns (uint256 amount) {
+        if (drops[coin].root != bytes32(0) || receivedAt[coin] == 0 || block.timestamp <= receivedAt[coin] + UNSET_WINDOW) revert NotUnset();
+        amount = IERC20(coin).balanceOf(address(this));
+        if (amount > 0) IERC20(coin).safeTransfer(pot, amount);
+        emit Swept(coin, amount);
+    }
+
     /// @notice Set a coin's drop once. `total` may not exceed what this contract holds of the coin.
     function setDrop(address coin, bytes32 root, uint256 total, uint64 expiry) external onlyOwner {
         if (drops[coin].root != bytes32(0)) revert AlreadySet();
-        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp) revert BadDrop();
+        if (root == bytes32(0) || total == 0 || total > type(uint128).max || expiry <= block.timestamp + SET_DELAY) revert BadDrop();
         if (total > IERC20(coin).balanceOf(address(this))) revert BadDrop();
-        drops[coin] = Drop({root: root, total: uint128(total), claimed: 0, expiry: expiry});
+        drops[coin] = Drop({root: root, total: uint128(total), claimed: 0, expiry: expiry, claimableFrom: uint64(block.timestamp) + SET_DELAY});
         emit DropSet(coin, root, total, expiry);
     }
 
     function claim(address coin, address account, uint256 amount, bytes32[] calldata proof) external nonReentrant {
         Drop storage d = drops[coin];
         if (d.root == bytes32(0)) revert NotOpen();
+        if (block.timestamp < d.claimableFrom) revert NotYet();
         if (block.timestamp > d.expiry) revert Expired();
         if (hasClaimed[coin][account]) revert AlreadyClaimed();
         bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));

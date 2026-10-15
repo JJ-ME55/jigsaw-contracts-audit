@@ -9,6 +9,7 @@ import {JIGLaunch} from "../src/JIGLaunch.sol";
 import {JIGLaunchHook} from "../src/JIGLaunchHook.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 /// Phase 1 deploy: PotVault, JIGLaunch, JIG, Vesting, the launch hook, then the fair launch.
 ///
@@ -28,8 +29,8 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 /// The hook is deployed with CREATE2 through forge's default deployer so its address carries the flag bits.
 contract DeployJIG is Script {
     int24 constant TICK_SPACING = 200;
-    uint160 constant SQRT_PRICE = 1980704062856608439838598758400000; // sqrt(6.25e8) * 2^96: 1 ETH = 625,000,000 JIG, $4k FDV at $2,500 ETH
-    int24 constant TICK_UPPER = 202_400; // just below the start tick (~202,542)
+    int24 constant TICK_UPPER = 202_400; // the start tick: price = TickMath.getSqrtPriceAtTick(TICK_UPPER), about 1 ETH = 616M JIG, ~$4k FDV
+    uint160 SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER); // range top == start price, so the first buy is at the start price
     int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
@@ -51,9 +52,9 @@ contract DeployJIG is Script {
         Vesting vesting = new Vesting();
         launch.setJig(address(jig));
 
-        bytes memory args = abi.encode(poolManager, address(jig), deployer);
+        bytes memory args = abi.encode(poolManager, address(jig), deployer, address(launch), SQRT_PRICE, TICK_SPACING);
         (address predicted, bytes32 salt) = _mine(type(JIGLaunchHook).creationCode, args);
-        JIGLaunchHook hook = new JIGLaunchHook{salt: salt}(poolManager, address(jig), deployer);
+        JIGLaunchHook hook = new JIGLaunchHook{salt: salt}(poolManager, address(jig), deployer, address(launch), SQRT_PRICE, TICK_SPACING);
         require(address(hook) == predicted, "hook address mismatch");
         if (root != bytes32(0)) hook.setAllowlist(root);
 
@@ -73,9 +74,10 @@ contract DeployJIG is Script {
     }
 
     /// Find a CREATE2 salt such that the hook lands on an address whose low 14 bits are exactly HOOK_FLAGS.
-    function _mine(bytes memory creationCode, bytes memory args) internal pure returns (address addr, bytes32 salt) {
+    function _mine(bytes memory creationCode, bytes memory args) internal view returns (address addr, bytes32 salt) {
         bytes32 initHash = keccak256(abi.encodePacked(creationCode, args));
-        for (uint256 i; i < 200_000; i++) {
+        uint256 seed = vm.envOr("SALT_SEED", uint256(0));
+        for (uint256 i = seed; i < seed + 200_000; i++) {
             salt = bytes32(i);
             addr = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, salt, initHash)))));
             if (uint160(addr) & Hooks.ALL_HOOK_MASK == HOOK_FLAGS) return (addr, salt);

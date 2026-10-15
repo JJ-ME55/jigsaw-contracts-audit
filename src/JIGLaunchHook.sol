@@ -23,8 +23,9 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///     (OpenZeppelin double-hash), set by the owner before the pool exists. Swappers
 ///     pass their proof as hookData. tx.origin is used on purpose: a router can lie
 ///     about msg.sender but nobody can fake the EOA that signed the transaction.
-///   - Serves exactly one pool: ETH / JIG with the dynamic-fee flag. Any other pool
-///     that points at this hook is refused at initialisation.
+///   - Serves exactly one pool: ETH / JIG with the dynamic-fee flag, the agreed tick
+///     spacing and start price, and only JIGLaunch may initialise it. Nobody can open
+///     the pool early to start the window or consume the hook.
 ///
 /// Address must carry exactly BEFORE_INITIALIZE_FLAG | BEFORE_SWAP_FLAG (0x2080) in
 /// its low 14 bits; the deploy script mines a CREATE2 salt for that.
@@ -38,6 +39,9 @@ contract JIGLaunchHook is IHooks {
     IPoolManager public immutable poolManager;
     address public immutable jig;
     address public immutable owner;
+    address public immutable launch; // the only contract allowed to initialise the pool
+    uint160 public immutable expectedSqrtPriceX96;
+    int24 public immutable expectedTickSpacing;
 
     bytes32 public allowlistRoot;
     uint64 public windowEnd; // 0 until the pool is initialised
@@ -50,12 +54,16 @@ contract JIGLaunchHook is IHooks {
     error NotOwner();
     error AlreadyInitialized();
     error WrongPool();
+    error NotLaunch();
     error HookNotImplemented();
 
-    constructor(address poolManager_, address jig_, address owner_) {
+    constructor(address poolManager_, address jig_, address owner_, address launch_, uint160 expectedSqrtPriceX96_, int24 expectedTickSpacing_) {
         poolManager = IPoolManager(poolManager_);
         jig = jig_;
         owner = owner_;
+        launch = launch_;
+        expectedSqrtPriceX96 = expectedSqrtPriceX96_;
+        expectedTickSpacing = expectedTickSpacing_;
         Hooks.validateHookPermissions(this, getHookPermissions());
     }
 
@@ -101,12 +109,13 @@ contract JIGLaunchHook is IHooks {
 
     // ---------------- hooks ----------------
 
-    function beforeInitialize(address, PoolKey calldata key, uint160) external override returns (bytes4) {
+    function beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96) external override returns (bytes4) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         if (initialized) revert AlreadyInitialized();
+        if (sender != launch) revert NotLaunch();
         if (
             Currency.unwrap(key.currency0) != address(0) || Currency.unwrap(key.currency1) != jig
-                || !key.fee.isDynamicFee()
+                || !key.fee.isDynamicFee() || key.tickSpacing != expectedTickSpacing || sqrtPriceX96 != expectedSqrtPriceX96
         ) revert WrongPool();
         initialized = true;
         windowEnd = uint64(block.timestamp) + WINDOW;

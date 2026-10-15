@@ -61,6 +61,8 @@ contract CoinFactory is ReentrancyGuard {
     error CollectionHasCoin();
     error RangeWrongSide();
     error FeeSendFailed();
+    error NotCollectionOwner();
+    error PoolInitFailed();
 
     constructor(
         address posm_,
@@ -101,8 +103,9 @@ contract CoinFactory is ReentrancyGuard {
         int24 tickUpper
     ) external payable nonReentrant returns (uint256 index, address coinAddr) {
         if (msg.value != launchFeeWei) revert WrongFee();
-        if (collection == address(0)) revert ZeroAddress();
+        if (collection == address(0) || collection.code.length == 0) revert ZeroAddress();
         if (coinOf[collection] != address(0)) revert CollectionHasCoin();
+        if (!_controlsCollection(msg.sender, collection)) revert NotCollectionOwner();
 
         CreatorCoin coin = new CreatorCoin(name, symbol, SUPPLY, collection, address(this));
         coinAddr = address(coin);
@@ -119,10 +122,10 @@ contract CoinFactory is ReentrancyGuard {
 
         int24 startTick = TickMath.getTickAtSqrtPrice(sqrtPriceX96);
         if (tickLower >= tickUpper) revert RangeWrongSide();
-        if (coinIs0 ? tickLower < startTick : tickUpper > startTick) revert RangeWrongSide();
+        if (coinIs0 ? tickLower <= startTick : tickUpper > startTick) revert RangeWrongSide();
 
         hook.register(key, msg.sender, flywheel, launchReferral, feePips);
-        posm.initializePool(key, sqrtPriceX96);
+        if (posm.initializePool(key, sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
 
         uint128 liquidity = coinIs0
             ? LiquidityAmounts.getLiquidityForAmount0(TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), POOL_SHARE)
@@ -141,6 +144,9 @@ contract CoinFactory is ReentrancyGuard {
         coin.approve(address(vesting), CREATOR_SHARE);
         uint256 vestingId = vesting.create(coinAddr, msg.sender, CREATOR_SHARE, 0, 0, CREATOR_VEST);
         IERC20(coinAddr).safeTransfer(airdropRecipient, AIRDROP_SHARE);
+        // let an AirdropClaim start its unset-drop clock; a plain address ignores this
+        (bool noted,) = airdropRecipient.call(abi.encodeWithSignature("notify(address)", coinAddr));
+        noted;
 
         index = launches.length;
         launches.push(Launch({coin: coinAddr, collection: collection, creator: msg.sender, tokenId: tokenId, vestingId: vestingId, key: key}));
@@ -148,6 +154,15 @@ contract CoinFactory is ReentrancyGuard {
         (bool ok,) = platform.call{value: msg.value}("");
         if (!ok) revert FeeSendFailed();
         emit CoinLaunched(index, coinAddr, collection, msg.sender, feePips, flywheel, tokenId);
+    }
+
+    /// @dev The caller must be the collection's owner() or creator() (both exist on LoomCollection).
+    function _controlsCollection(address who, address collection) internal view returns (bool) {
+        (bool ok, bytes memory ret) = collection.staticcall(abi.encodeWithSignature("owner()"));
+        if (ok && ret.length == 32 && abi.decode(ret, (address)) == who) return true;
+        (ok, ret) = collection.staticcall(abi.encodeWithSignature("creator()"));
+        if (ok && ret.length == 32 && abi.decode(ret, (address)) == who) return true;
+        return false;
     }
 
     function count() external view returns (uint256) {
