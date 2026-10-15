@@ -69,10 +69,32 @@ Reads `LAUNCH_PK` (deployer and launcher) and optional `POT_OWNER`. Refuses chai
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook | Claude, 15 Oct, with 25 passing tests (14 unit, 11 on a Sepolia fork) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin | Claude, 15 Oct, with 34 passing tests (14 unit, 20 on a Sepolia fork) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
-## Phase 2 (not started)
+## Phase 2, live on Sepolia (15 Oct 2026)
 
-Creator-coin fee hook (shared, creator-set fee 1 to 10%, six-way split, converts to JIG), coin factory, holder drip, sweep and burn. Spec section 6. The JIG launch hook above is a separate, simpler contract and stays as is.
+| Contract | Address | What it does |
+|---|---|---|
+| CreatorFeeHook | `0x2c416Cf88f853a593171c30D879aBd7c29986044` | the one shared hook for every creator coin. Takes the creator's fee (1 to 10%, lower-only) from every swap's unspecified currency; if that is the coin it sells it for JIG in the same transaction; credits creator / flywheel / launch referral / trade referral / platform / pot / deepening as claimable JIG. Anti-snipe: 60% decaying to the chosen fee over the first 10 minutes. Address flag bits 0x2044 |
+| CoinFactory | `0x9e9b33e0a9254526CB08b63448EA22A5f4Ea0e27` | one call launches a coin: 1B fixed supply, coin/JIG pool (LP fee 0) on the hook, 90% seeded single-sided, LP NFT held by the factory forever, 5% creator vesting (6 months), 5% airdrop share, 0.01 ETH launch fee to platform |
+| CreatorCoin | deployed per launch | fixed-supply ERC-20 with the collection address baked in, burnable |
+
+Fee split, in basis points of the fee: flywheel 2000, launch referral 1000, trade referral 1000, pot 300, deepening 200, platform 1500 / 2000 / 2500 / 3000 by fee band (1% / 2-3% / 4-6% / 7-10%), creator the remainder. Referrals default to platform. The trade referral is the address passed as `hookData` with the swap (the front end passes its own address).
+
+Design notes an auditor should know:
+
+- **Fees are held as ERC-6909 claims inside the PoolManager**, not as ERC-20 in the hook. `take` would fail on a fresh chain because the swapper's input is settled after `afterSwap` runs; claims need no physical balance. `claim()` burns the claims and takes real JIG through an `unlock` callback.
+- **The coin-side conversion is a nested swap on the same pool inside `afterSwap`**, guarded by `_converting` so the nested swap is not charged again. This is the Zora pattern.
+- **Placeholders until their contracts exist:** the deepening slice and the 5% airdrop share both go to the PotVault. The LP-deepening module and AirdropClaim contract replace those addresses in a redeploy of the hook and factory (both are immutables on purpose).
+- **The early max-wallet from the spec is not built.** The decaying 60% fee is the anti-snipe measure.
+- **hook.setFactory is one-shot**, because the hook and factory reference each other.
+
+Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
+
+Deploy: `script/DeployCoins.s.sol`, bound to the JIG set above by env vars.
+
+## Still to build
+
+Holder drip, sweep and burn, airdrop claim, NFT contract v2 (mint referral), sweep and raffle, buyback and burn, LP deepening. Then the audit round per the plan of record.
