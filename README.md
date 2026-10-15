@@ -108,7 +108,7 @@ Residual trust, by design: the sweep keeper can still buy its own listing at up 
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 50 passing tests (14 unit, 36 on a Sepolia fork) plus the two adversarial review passes above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 51 passing tests (14 unit, 37 on a Sepolia fork) plus the two adversarial review passes above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | pending: needs 0.5 IMD in the operating wallet, then one `job.open` audit job | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
@@ -123,6 +123,8 @@ Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREA
 | HolderDrip | one per coin, deployed by the back end before launch and passed as `flywheel` | pulls the flywheel slice from the hook and accrues it per NFT; holders claim in JIG for the tokens they own. Anyone may pull |
 | SweepAndBurn | one per coin, same | keeper-only: sells JIG for ETH on the JIG/ETH pool with a keeper-supplied minimum out, pays an approved marketplace order, checks the NFT arrived, sends it to the dead address. The creator approves marketplaces and sets the price cap |
 | BuybackAndBurn | one per coin, same | keeper-only, at random times the back end picks: buys the coin on its own pool with the whole balance (keeper-supplied minimum out), burns it |
+| HolderPayouts | `0x965a81fA58F5E25cCfDc2a4e710311Ee8C84C4C7` | shared. Snapshot rounds for the "fees to coin holders" and "split NFT and coin holders" flywheels: a per-coin SnapshotForwarder delivers the slice here; the platform snapshots holders at a random moment and declares a round (merkle root, total, 7-day window); holders claim; unclaimed returns to the coin's balance for the next round. No withdraw. No staking anywhere (Jj, 15 Oct) |
+| SnapshotForwarder | one per coin, passed as `flywheel` | pulls the slice from the hook and funds HolderPayouts under its coin. Anyone may pull |
 | LPDeepening | `0x6220Bed6AE2A86397cDD500a52C1D74188f006F4` | shared, keeper-only. The deepening slice of every coin fee: sells half for ETH on the JIG/ETH pool (keeper-supplied minimum out) and adds both as full-range liquidity to a position it holds forever. LP fees it earns go to the pot. Bound to the hook once via `setDeepening` |
 
 Fee split, in basis points of the fee: pot 300 and deepening 200 fixed; platform 2500 / 3000 / 3500 / 4000 by fee band (1% / 2-3% / 4-6% / 7-10%); the rest (7000 / 6500 / 6000 / 5500) is the creator+flywheel block, which the creator divides with `setCreatorShare` (default flywheel 2000, creator the remainder). A creator's or flywheel's balance untouched for 7 days can be folded back through the same split by anyone (`recycle`). Anti-snipe on creator coins: 60% decaying to the chosen fee over 10 seconds.
@@ -137,10 +139,22 @@ Design notes an auditor should know:
 - **The early max-wallet from the spec is not built.** The decaying 60% fee is the anti-snipe measure.
 - **hook.setFactory is one-shot**, because the hook and factory reference each other.
 
-Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop, sweep, buyback and deepening end to end; `RegressionsFork` pins the review fixes. 50 tests in all. on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
+Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop, sweep, buyback and deepening end to end; `RegressionsFork` pins the review fixes. 51 tests in all. on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
 
 Deploy: `script/DeployCoins.s.sol` (hook + factory, CREATE2-mined; `SALT_SEED` to redeploy with identical args), `script/DeployRest.s.sol` (AirdropClaim) and `script/DeployDeepening.s.sol` (LPDeepening + binding; `KEEPER`), all driven by env vars.
 
+## Flywheel menu
+
+| Option | Module | Status |
+|---|---|---|
+| Fees to the team wallet | none (flywheel = creator) | built |
+| Floor sweep and burn | SweepAndBurn | built |
+| Fees to NFT holders | HolderDrip | built |
+| Fees to coin holders | SnapshotForwarder + HolderPayouts | built |
+| Split NFT holders and coin holders | SnapshotForwarder + HolderPayouts (the snapshot lists both) | built |
+| Buyback and burn | BuybackAndBurn | built |
+| Floor sweep and raffle | needs verifiable randomness (Chainlink VRF) on the target chain | not built |
+
 ## Still to build
 
-Sweep and raffle only (the mint referral for the NFT contract was dropped with the rest of referrals). It needs verifiable randomness (Chainlink VRF) on the target chain; Robinhood Chain's VRF availability is unconfirmed, so it waits for the chain decision. Everything else in the signed spec is on Sepolia. Next: the throwaway-repo swarm audit round per the plan of record.
+Sweep and raffle only. It needs verifiable randomness (Chainlink VRF) on the target chain; Robinhood Chain's VRF availability is unconfirmed, so it waits for the chain decision. Everything else in the signed spec is on Sepolia. Next: the throwaway-repo swarm audit round per the plan of record.

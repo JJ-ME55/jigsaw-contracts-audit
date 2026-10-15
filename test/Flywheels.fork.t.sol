@@ -14,6 +14,8 @@ import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {SweepAndBurn} from "../src/SweepAndBurn.sol";
 import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
 import {LPDeepening} from "../src/LPDeepening.sol";
+import {HolderPayouts} from "../src/HolderPayouts.sol";
+import {SnapshotForwarder} from "../src/SnapshotForwarder.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
@@ -274,6 +276,46 @@ contract FlywheelsForkTest is Test {
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
         return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: 0, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+    }
+
+    // ---------- SnapshotForwarder + HolderPayouts ----------
+
+    function test_snapshot_payouts_round_trip() public {
+        HolderPayouts payouts = new HolderPayouts(platform, address(jig));
+        // the forwarder needs the coin address, which the factory creates: predict it
+        address predictedCoin = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        SnapshotForwarder fwd = new SnapshotForwarder(address(hook), address(payouts), predictedCoin);
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(address(fwd));
+        assertEq(address(coin), predictedCoin);
+        _buyCoin(key, coinIs0, 100_000e18);
+        uint256 slice = hook.claimable(address(fwd));
+        assertGt(slice, 0);
+        fwd.pull();
+        assertEq(payouts.balance(address(coin)), slice, "slice delivered under this coin");
+        assertEq(jig.balanceOf(address(fwd)), 0);
+
+        // platform snapshots and declares a round: A 60%, B 40%
+        uint256 aAmt = slice * 60 / 100; uint256 bAmt = slice - aAmt;
+        bytes32 la = keccak256(bytes.concat(keccak256(abi.encode(holderA, aAmt))));
+        bytes32 lb = keccak256(bytes.concat(keccak256(abi.encode(holderB, bAmt))));
+        bytes32 root = la < lb ? keccak256(abi.encodePacked(la, lb)) : keccak256(abi.encodePacked(lb, la));
+        vm.prank(buyer);
+        vm.expectRevert();
+        payouts.declare(address(coin), root, slice, uint64(block.timestamp + 7 days));
+        vm.prank(platform);
+        uint256 round = payouts.declare(address(coin), root, slice, uint64(block.timestamp + 7 days));
+        assertEq(payouts.balance(address(coin)), 0);
+        bytes32[] memory pa = new bytes32[](1); pa[0] = lb;
+        payouts.claim(address(coin), round, holderA, aAmt, pa);
+        assertEq(jig.balanceOf(holderA), aAmt);
+        vm.expectRevert(HolderPayouts.AlreadyClaimed.selector);
+        payouts.claim(address(coin), round, holderA, aAmt, pa);
+        vm.expectRevert(HolderPayouts.NotExpired.selector);
+        payouts.settle(address(coin), round);
+        vm.warp(block.timestamp + 7 days + 1);
+        uint256 back = payouts.settle(address(coin), round);
+        assertEq(back, bAmt, "unclaimed returns to the coin's balance for the next round");
+        assertEq(payouts.balance(address(coin)), bAmt);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
