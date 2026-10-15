@@ -48,9 +48,10 @@ contract DeployCoins is Script {
         console.log("launch fee wei ", launchFee);
     }
 
-    function _mine(bytes memory creationCode, bytes memory args) internal pure returns (address addr, bytes32 salt) {
+    function _mine(bytes memory creationCode, bytes memory args) internal view returns (address addr, bytes32 salt) {
         bytes32 initHash = keccak256(abi.encodePacked(creationCode, args));
-        for (uint256 i; i < 300_000; i++) {
+        uint256 seed = vm.envOr("SALT_SEED", uint256(0)); // bump to redeploy a hook with identical constructor args
+        for (uint256 i = seed; i < seed + 300_000; i++) {
             salt = bytes32(i);
             addr = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, salt, initHash)))));
             if (uint160(addr) & Hooks.ALL_HOOK_MASK == HOOK_FLAGS) return (addr, salt);
