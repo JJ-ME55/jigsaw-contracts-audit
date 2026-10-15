@@ -65,7 +65,7 @@ Reads `LAUNCH_PK` (deployer and launcher) and optional `POT_OWNER`. Refuses chai
 
 ## Audit status
 
-**Founders' decision, 15 Oct 2026 (Jj):** for now the only audits are IMD swarm audits. Each contract gets one at write time and one more after the full set is frozen. The external audit is deferred, not cancelled; the scope document is kept current so it can go out the day the decision changes. The fee hook and factory carry every coin's money, so this is the main open risk on the project.
+**Plan of record, 15 Oct 2026 (Jj):** build the whole contract base on Sepolia first, no audits during the build. Then flip the repo public, have the IMD swarm audit the full base from the repo (the swarm cannot read a private repo and refuses requests with source embedded), fix findings, re-audit, launch nothing. When everything has passed, tell Fish the back end is ready and go to mainnet in one sequence: JIG, then the NFT factory, then the creator-coin side. Then make the repo private again. External audit deferred; the fee hook and factory carry every coin's money, so that stays the main open risk.
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
