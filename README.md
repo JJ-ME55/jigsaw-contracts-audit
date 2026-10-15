@@ -19,11 +19,11 @@ Pool on Sepolia today: ETH / JIG, 1% fee, tick spacing 200, no hook. The Sepolia
 |---|---|
 | Start FDV | about $4k, a pump.fun-style start: 1 ETH = 625,000,000 JIG at $2,500 ETH. Recompute the sqrt price from the live ETH price on launch day |
 | Range | full range above the start price, single-sided JIG, no cap |
-| First 10 minutes | only allowlisted friends-and-family wallets can buy; fee 60%, all of it to the pot |
+| First 10 minutes | allowlisted friends-and-family wallets buy at the normal 1%; any other wallet pays a 60% fee, all of it to the pot (sniper tax) |
 | After 10 minutes | open to everyone, fee 1%, all LP fees to the pot forever (LP locked, pot is the only sink) |
 | Contract address | vanity prefix via a CREATE2 salt grind, on the final mainnet deploy only |
 
-The 10-minute window needs a hook on the JIG pool: `beforeSwap` checks an allowlist until `start + 10 min` and returns a 60% override fee (v4 allows dynamic LP fees up to 100%). That is the first job of the phase 2 hook work, so the JIG mainnet launch depends on it.
+The 10-minute window needs a hook on the JIG pool: `beforeSwap` checks the allowlist until `start + 10 min` and returns a 1% fee for listed wallets and a 60% override for everyone else (v4 allows dynamic LP fees up to 100%). That is the first job of the phase 2 hook work, so the JIG mainnet launch depends on it.
 
 Pot owner is the operating wallet for now. Before mainnet it must be a 2-of-2 multisig of both founders.
 
