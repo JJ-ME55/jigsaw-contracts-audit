@@ -2,8 +2,10 @@
 //
 // Coin-holder rounds (HolderPayouts, fed by a coin's SnapshotForwarder): at a random moment, snapshot who holds the
 // coin (from its Transfer logs, indexed incrementally) and split the coin's JIG balance in HolderPayouts pro rata.
-// Protocol addresses are excluded (pool manager, factory, hook, claim contracts, the coin, burn addresses).
-// Airdrop (AirdropClaim, the 5% of every coin): at a random moment 24 to 72 h after launch, snapshot the collection's
+// Protocol addresses are excluded (pool manager, factory, hook, claim contracts, deepening, pot, the platform's fee
+// wallet PLATFORM_ADDRESS, the coin, burn addresses). At most MAX_HOLDERS holders per round (a larger list is refused).
+// Airdrop (AirdropClaim, the 5% of every coin): at the creator's chosen time (coinSettings; default a random moment 1 to
+// 3 days after launch, never later than 7 days less 12 hours), snapshot the collection's
 // NFT holders (ownerOf over ids 1..totalSupply) and give every NFT an equal share. Both windows are 7 days; unclaimed
 // payout JIG returns to the coin's balance on settle(), unclaimed airdrop goes to the pot.
 //
@@ -34,7 +36,9 @@ const writeJson = (p, v) => { fs.mkdirSync(path.dirname(p), { recursive: true })
 
 /** First block at or after unix time `ts` (binary search on headers; cached per coin). */
 async function blockAt(p, ts) {
-  let hi = await p.getBlockNumber(); let lo = hi > 2_000_000n ? hi - 2_000_000n : 0n;
+  // the whole chain, not a recent window: Robinhood makes ~6 blocks a second, so a 2M-block window was under 4 days
+  // and a quiet coin indexed later would have missed its earliest holders (pre-audit review, 16 Oct)
+  let hi = await p.getBlockNumber(); let lo = 0n;
   while (lo < hi) { const mid = (lo + hi) / 2n; const b = await p.getBlock({ blockNumber: mid }); if (Number(b.timestamp) < ts) lo = mid + 1n; else hi = mid; }
   return lo;
 }
@@ -43,7 +47,8 @@ async function blockAt(p, ts) {
 export async function holders(coin, launchedAt) {
   const p = pub(); coin = getAddress(coin);
   const idx = readJson(file('index', `${coin}.json`), null) ?? { fromBlock: (await blockAt(p, Number(launchedAt) - 60)).toString(), balances: {} };
-  const head = await p.getBlockNumber();
+  // index only to the 'safe' block: a reorged block indexed at `latest` would leave phantom balances for good
+  const head = await p.getBlock({ blockTag: 'safe' }).then((b) => b.number).catch(() => p.getBlockNumber());
   let from = BigInt(idx.fromBlock); let step = 10_000n;
   while (from <= head) {
     const to = from + step - 1n > head ? head : from + step - 1n;
@@ -61,7 +66,10 @@ export async function holders(coin, launchedAt) {
   return { block: head, balances: idx.balances };
 }
 
-const excluded = (a, coin) => new Set([ZERO, DEAD, coin, a.factory, a.feeHook, a.airdrop, a.payouts, a.deepening, a.pot, POOL_MANAGER[a.chainId]].filter(Boolean).map((x) => getAddress(x)));
+// the platform's swap-fee wallet collects coin from every buy; it is not a holder (replica review, 17 Oct)
+const excluded = (a, coin) => new Set([ZERO, DEAD, coin, a.factory, a.feeHook, a.airdrop, a.payouts, a.deepening, a.pot, POOL_MANAGER[a.chainId], process.env.PLATFORM_ADDRESS].filter((x) => x && /^0x[0-9a-fA-F]{40}$/.test(x)).map((x) => getAddress(x)));
+export const MAX_HOLDERS = Number(process.env.PAYOUT_MAX_HOLDERS ?? 200_000);
+export const MAX_NFTS = Number(process.env.AIRDROP_MAX_NFTS ?? 50_000);
 
 /** Pro-rata split of `total` over eligible balances (floored; the sum never exceeds total). */
 export function split(balances, total, skip) {
@@ -78,6 +86,7 @@ export async function prepareRound(coin, launchedAt) {
   if (bal === 0n) return null;
   const snap = await holders(coin, launchedAt);
   const alloc = split(snap.balances, bal, excluded(a, coin));
+  if (Object.keys(alloc).length > MAX_HOLDERS) throw new Error(`${Object.keys(alloc).length} holders is over the ${MAX_HOLDERS} limit; round refused`);
   const t = amountTree(alloc); if (!t.root) return null;
   const round = Number(await p.readContract({ address: a.payouts, abi: payoutsAbi, functionName: 'roundCount', args: [coin] }));
   const expiry = Math.floor(Date.now() / 1000) + WINDOW_S;
@@ -93,6 +102,28 @@ export async function expiredRounds(coin) {
   return out.map((r) => ({ round: r, call: { address: a.payouts, abi: payoutsAbi, functionName: 'settle', args: [coin, BigInt(r)] } }));
 }
 
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11'; // same address on Sepolia, Ethereum and Robinhood
+/** NFTs held per owner for ids 1..n, through Multicall3 in batches. A token whose ownerOf reverts (it does not exist)
+ *  never happens for ids <= totalSupply (no burn function); any failure (rate limit, timeout) throws and the snapshot is
+ *  abandoned, never half-taken:
+ *  setDrop can be set once, so a silently dropped holder would lose their share for good (pre-audit review, 16 Oct). */
+export async function nftOwners(p, collection, n, batch = 500) {
+  const owners = {};
+  for (let lo = 1; lo <= n; lo += batch) {
+    const ids = []; for (let id = lo; id <= Math.min(n, lo + batch - 1); id++) ids.push(id);
+    const res = await p.multicall({ multicallAddress: MULTICALL3, allowFailure: true, contracts: ids.map((id) => ({ address: collection, abi: nftAbi, functionName: 'ownerOf', args: [BigInt(id)] })) });
+    for (let k = 0; k < res.length; k++) {
+      const r = res[k];
+      // ids run 1..totalSupply and LoomCollection has no burn function, so every one exists: any failure is the RPC
+      // (viem reports a failed request as every call failing), and a partial snapshot must never be used
+      if (r.status !== 'success') throw new Error(`ownerOf(${ids[k]}) failed (${r.error?.shortMessage ?? r.error?.name ?? 'unknown'}); snapshot abandoned, retried later`);
+      const o = getAddress(r.result); if (o === getAddress(DEAD)) continue;
+      owners[o] = (owners[o] ?? 0n) + 1n;
+    }
+  }
+  return owners;
+}
+
 /** Prepare the airdrop for `coin`: NFT holders of its collection, equal share per NFT. Null if not due or already set. */
 export async function prepareAirdrop(coin, collection) {
   const a = addresses(); const p = pub(); coin = getAddress(coin);
@@ -103,8 +134,8 @@ export async function prepareAirdrop(coin, collection) {
   const total = await p.readContract({ address: coin, abi: erc20, functionName: 'balanceOf', args: [a.airdrop] });
   const n = Number(await p.readContract({ address: collection, abi: nftAbi, functionName: 'totalSupply' }));
   if (n === 0 || total === 0n) return null;
-  const owners = {};
-  for (let id = 1; id <= n; id++) { const o = await p.readContract({ address: collection, abi: nftAbi, functionName: 'ownerOf', args: [BigInt(id)] }).catch(() => null); if (o && getAddress(o) !== getAddress(DEAD)) owners[getAddress(o)] = (owners[getAddress(o)] ?? 0n) + 1n; }
+  if (n > MAX_NFTS) throw new Error(`collection reports ${n} NFTs, over the ${MAX_NFTS} limit; airdrop snapshot refused`);
+  const owners = await nftOwners(p, collection, n);
   const nfts = Object.values(owners).reduce((s, v) => s + v, 0n); if (nfts === 0n) return null;
   const per = total / nfts; const alloc = {}; for (const [k, v] of Object.entries(owners)) alloc[k] = (per * v).toString();
   const t = amountTree(alloc);
@@ -112,6 +143,27 @@ export async function prepareAirdrop(coin, collection) {
   const rec = { kind: 'airdrop', coin, collection, nfts: nfts.toString(), perNft: per.toString(), expiry, ...t, setTx: null, preparedAt: new Date().toISOString() };
   return { rec, path: file('airdrops', `${coin}.json`), call: { address: a.airdrop, abi: airdropAbi, functionName: 'setDrop', args: [coin, t.root, BigInt(t.total), BigInt(expiry)] } };
 }
+
+// ---------------- cheap checks for the keeper (no snapshot) ----------------
+/** Does `coin` still need its airdrop set, and is there time? { needed, receivedAt } */
+export async function airdropPending(coin) {
+  const a = addresses(); const p = pub(); coin = getAddress(coin);
+  const d = await p.readContract({ address: a.airdrop, abi: airdropAbi, functionName: 'drops', args: [coin] });
+  if (d[0] !== '0x' + '0'.repeat(64)) return { needed: false };
+  const receivedAt = Number(await p.readContract({ address: a.airdrop, abi: airdropAbi, functionName: 'receivedAt', args: [coin] }));
+  return { needed: !!receivedAt && Date.now() / 1000 <= receivedAt + WINDOW_S - 3600, receivedAt };
+}
+/** JIG waiting in HolderPayouts for `coin`'s next round. */
+export async function payoutBalance(coin) {
+  const a = addresses(); return pub().readContract({ address: a.payouts, abi: payoutsAbi, functionName: 'balance', args: [getAddress(coin)] });
+}
+/** The root declared on chain for round `n` of `coin` (to check it matches the tree we serve). */
+export async function roundRoot(coin, n) {
+  const a = addresses(); const R = await pub().readContract({ address: a.payouts, abi: payoutsAbi, functionName: 'rounds', args: [getAddress(coin), BigInt(n)] });
+  return R[0];
+}
+/** A record already declared or set on chain is never overwritten. */
+export function recordIsFinal(p) { const r = readJson(p, null); return !!(r && (r.declaredTx || r.setTx)); }
 
 // ---------------- serving ----------------
 export function roundsOf(coin) {

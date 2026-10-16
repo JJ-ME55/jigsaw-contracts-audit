@@ -9,8 +9,10 @@ import {AirdropClaim} from "../src/AirdropClaim.sol";
 
 /// Phase 2 deploy: the shared CreatorFeeHook and the CoinFactory, bound to an existing JIG set.
 ///
-/// Sepolia only. Reads LAUNCH_PK (deployer = hook owner), JIG, POT, optional PLATFORM
-/// (default deployer), AIRDROP (default POT), LAUNCH_FEE_WEI (default 0.01 ether).
+/// Reads LAUNCH_PK (the JIG deployer = hook owner, also AirdropClaim's first owner), JIG, POT, AIRDROP (required),
+/// PLATFORM, LAUNCH_FEE_WEI and AIRDROP_OWNER (all three required on a mainnet; test-chain defaults: deployer,
+/// 0.01 ether, deployer). After binding AirdropClaim to the factory it hands it to AIRDROP_OWNER, which must call
+/// acceptOwnership().
 ///
 ///   set -a; . ../backend/.env; set +a
 ///   JIG=0x... POT=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
@@ -27,9 +29,12 @@ contract DeployCoins is Script {
         address deployer = vm.addr(pk);
         address jig = vm.envAddress("JIG");
         address pot = vm.envAddress("POT");
-        address platform = vm.envOr("PLATFORM", deployer);
+        bool mainnet = block.chainid == 1 || block.chainid == 4663;
+        address platform = mainnet ? vm.envAddress("PLATFORM") : vm.envOr("PLATFORM", deployer); // the Safe: fees and the launch fee setter
         address airdrop = vm.envAddress("AIRDROP"); // required: a wrong recipient would brick every launch (swarm audit 2)
-        uint256 launchFee = vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
+        // $149 in ETH on launch day (the Safe re-prices it later); the 0.01 ETH default is for test chains only
+        uint256 launchFee = mainnet ? vm.envUint("LAUNCH_FEE_WEI") : vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
+        address airdropOwner = mainnet ? vm.envAddress("AIRDROP_OWNER") : vm.envOr("AIRDROP_OWNER", deployer);
 
         vm.startBroadcast(pk);
         bytes memory args = abi.encode(poolManager, jig, deployer, platform, pot);
@@ -41,6 +46,8 @@ contract DeployCoins is Script {
         if (airdrop != pot) {
             // bind the AirdropClaim to this factory so only it can start unset-drop clocks (owner must be the deployer)
             AirdropClaim(airdrop).setFactory(address(factory)); // must succeed: an unbound claim would make every launch revert
+            // hand it to the operator that writes drop roots; Ownable2Step: AIRDROP_OWNER must call acceptOwnership()
+            if (airdropOwner != deployer) AirdropClaim(airdrop).transferOwnership(airdropOwner);
         }
         vm.stopBroadcast();
 

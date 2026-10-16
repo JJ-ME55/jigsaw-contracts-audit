@@ -3,10 +3,12 @@
 //
 // Payout cadence: daily | weekly (default) | fortnightly | monthly. Time since launch is cut into windows of that
 // length and one round is declared at a random moment inside each window, so nobody can buy just before a known
-// snapshot. minRoundUsd skips a window whose round would be smaller (the JIG waits for the next one).
+// payout snapshot. minRoundUsd skips a window whose round would be smaller (the JIG waits for the next one).
 // Airdrop: auto (default: a random moment 1 to 3 days after launch) | launch (as soon as the keeper sees the coin) |
-// days (N days after launch, 1 to 6) | soldout (when the collection sells out, at most 6 days). AirdropClaim sends
-// the 5% to the pot if no drop is set within 7 days, so nothing can be later than 6 days.
+// days (N days after launch, 1 to 6) | soldout (when the collection sells out, at most 6 days). Only auto is random:
+// launch, days and soldout give a time the creator (and anyone reading the settings) knows in advance, by their choice. AirdropClaim sends
+// the 5% to the pot if no drop is set within 7 days, so nothing can be later than 6 days. The airdrop choice is fixed
+// once the coin is launched; minRoundUsd is at most $1,000. The nonce makes every signature single-use (no expiry).
 //
 // Who may set them: the collection's creator, exactly as CoinFactory decides who may launch (creator(), or owner()
 // only when the collection has no creator()). Proven by signing the canonical message below with that wallet.
@@ -19,6 +21,7 @@ import { addresses } from './jig.mjs';
 
 export const CADENCES = { daily: 86_400, weekly: 7 * 86_400, fortnightly: 14 * 86_400, monthly: 30 * 86_400 };
 export const AIRDROP_MODES = ['auto', 'launch', 'days', 'soldout'];
+export const MAX_MIN_ROUND_USD = 1000;
 export const DEFAULTS = { cadence: 'weekly', minRoundUsd: 0, airdrop: { mode: 'auto', days: null } };
 const FILE = () => path.join(DATA, 'coin-settings.json');
 const read = () => { try { return JSON.parse(fs.readFileSync(FILE(), 'utf8')); } catch { return {}; } };
@@ -29,7 +32,8 @@ export function normalise(input) {
   const cadence = String(input?.cadence ?? DEFAULTS.cadence);
   if (!CADENCES[cadence]) throw new Error(`cadence must be one of ${Object.keys(CADENCES).join(', ')}`);
   const minRoundUsd = Number(input?.minRoundUsd ?? 0);
-  if (!Number.isFinite(minRoundUsd) || minRoundUsd < 0 || minRoundUsd > 100_000) throw new Error('minRoundUsd must be between 0 and 100000');
+  // capped so a creator cannot hold the holders' JIG back indefinitely with an unreachable minimum (pre-audit review, 16 Oct)
+  if (!Number.isFinite(minRoundUsd) || minRoundUsd < 0 || minRoundUsd > MAX_MIN_ROUND_USD) throw new Error(`minRoundUsd must be between 0 and ${MAX_MIN_ROUND_USD}`);
   const mode = String(input?.airdrop?.mode ?? 'auto');
   if (!AIRDROP_MODES.includes(mode)) throw new Error(`airdrop.mode must be one of ${AIRDROP_MODES.join(', ')}`);
   let days = null;
@@ -56,10 +60,23 @@ export function get(collection) {
 }
 
 const collAbi = parseAbi(['function creator() view returns (address)', 'function owner() view returns (address)']);
+const factoryAbi = parseAbi(['function coinOf(address) view returns (address)']);
+/** The coin launched on `collection`, or null. */
+export async function coinOf(pub, collection) {
+  const a = addresses(); if (!a.factory) return null;
+  const c = await pub.readContract({ address: a.factory, abi: factoryAbi, functionName: 'coinOf', args: [collection] });
+  return c && c !== '0x0000000000000000000000000000000000000000' ? getAddress(c) : null;
+}
 /** CoinFactory's rule: creator() if the collection has one, else owner(). */
+// Exactly as CoinFactory._controlsCollection: if creator() answers, that is the answer (zero means nobody); owner() only
+// when the collection has no creator(). An RPC error is an error, never "no creator()" (replica review, 17 Oct).
+const reverted = (e) => /Revert|ZeroData|returned no data|execution reverted/i.test(`${e?.name} ${e?.cause?.name} ${e?.shortMessage} ${e?.message}`);
 export async function creatorOf(pub, collection) {
-  try { const c = await pub.readContract({ address: collection, abi: collAbi, functionName: 'creator' }); if (c && c !== '0x0000000000000000000000000000000000000000') return getAddress(c); } catch {}
-  return getAddress(await pub.readContract({ address: collection, abi: collAbi, functionName: 'owner' }));
+  let c;
+  try { c = await pub.readContract({ address: collection, abi: collAbi, functionName: 'creator' }); }
+  catch (e) { if (!reverted(e)) throw e; return getAddress(await pub.readContract({ address: collection, abi: collAbi, functionName: 'owner' })); }
+  if (!c || c === '0x0000000000000000000000000000000000000000') throw Object.assign(new Error('this collection has no creator, so nobody can launch its coin or set its settings'), { status: 403 });
+  return getAddress(c);
 }
 
 /**
@@ -79,6 +96,11 @@ export async function set(collection, input, signature, nonce, deps = {}) {
   // verifyMessage on the public client handles plain wallets and smart-contract wallets (EIP-1271)
   const ok = await pub.verifyMessage({ address: creator, message: msg, signature }).catch(() => false);
   if (!ok) throw Object.assign(new Error('signature is not from the collection creator'), { status: 403 });
+  // the airdrop timing is fixed once the coin exists: changing it then would let the creator time the NFT snapshot
+  // around their own buys (pre-audit review, 16 Oct). Cadence and the minimum may still change.
+  const prev = get(collection).airdrop;
+  if ((prev.mode !== s.airdrop.mode || (prev.days ?? null) !== (s.airdrop.days ?? null)) && (await (deps.coinOf ?? coinOf)(pub, collection)))
+    throw Object.assign(new Error('the airdrop timing cannot change after the coin has launched'), { status: 409 });
   const all = read(); all[collection] = { settings: s, by: creator, nonce: Number(nonce), updatedAt: new Date().toISOString() }; write(all);
   return get(collection);
 }

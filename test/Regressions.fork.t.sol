@@ -60,11 +60,16 @@ contract RegressionsForkTest is Test {
     PotVault pot; JIG jig; Vesting vesting; JIGLaunch launch; CreatorFeeHook hook; CoinFactory factory;
     OwnedNFT nft; PoolSwapTest swapper; PoolKey jigKey;
 
+    /// JIG's address decides which side of every coin pool it sits on; the low-address variants override this.
+    function _deployJig(address l, address p) internal virtual returns (JIG) {
+        return new JIG(l, p);
+    }
+
     function setUp() public {
         vm.createSelectFork("sepolia");
         pot = new PotVault(owner);
         launch = new JIGLaunch(POSM, PERMIT2, owner, address(pot), platform);
-        jig = new JIG(address(launch), address(pot));
+        jig = _deployJig(address(launch), address(pot));
         vesting = new Vesting();
         vm.startPrank(owner);
         launch.setJig(address(jig));

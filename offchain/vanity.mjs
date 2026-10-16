@@ -35,8 +35,8 @@ const pub = () => { const a = addresses(); const c = CHAINS[a.chainId]; return c
 /** The plain salt every collection can use (no ending): the collection in the first 20 bytes, zeros after. */
 export const plainSalt = (collection) => `${getAddress(collection).toLowerCase()}${'0'.repeat(24)}`;
 
-let _running = null; const _queue = [];
-/** State of the grind for these inputs; starts it if needed. { state: ready|grinding|queued|unavailable|failed, salt?, coin? } */
+let _running = null; const _queue = []; const MAX_QUEUE = Number(process.env.VANITY_MAX_QUEUE ?? 10);
+/** State of the grind for these inputs; starts it if needed. { state: ready|grinding|queued|busy|unavailable|failed, salt?, coin? } */
 export function request(collection, name, symbol) {
   const a = addresses(); if (!a.factory) throw new Error('COIN_FACTORY not set');
   if (!isAddress(collection)) throw new Error('collection address required');
@@ -47,7 +47,12 @@ export function request(collection, name, symbol) {
   if (_queue.some((q) => q.key === k)) return { state: 'queued', ending: ENDING };
   if (!castBin()) return { state: 'unavailable', reason: 'no grinder on this server (Foundry cast); the coin launches without the ending', ending: ENDING };
   if (all[k]?.state === 'failed' && Date.now() - all[k].at < 10 * 60_000) return all[k];
-  _queue.push({ key: k, factory: a.factory, collection: getAddress(collection), name, symbol });
+  // one queued grind per collection (a renamed coin replaces its older request) and a bounded queue, so a caller
+  // cycling names cannot keep the grinder busy for everyone else (pre-audit review, 16 Oct)
+  const col = getAddress(collection);
+  const dup = _queue.findIndex((q) => q.collection === col); if (dup >= 0) _queue.splice(dup, 1);
+  if (_queue.length >= MAX_QUEUE) return { state: 'busy', reason: `the grinder has ${_queue.length} coins waiting; try again in a few minutes, or launch without the ending`, ending: ENDING };
+  _queue.push({ key: k, factory: a.factory, collection: col, name, symbol });
   pump();
   return { state: _running?.key === k ? 'grinding' : 'queued', ending: ENDING };
 }

@@ -20,7 +20,7 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
 
     struct Distribution {
         address token; // address(0) = ETH
-        bytes32 root; // merkle root of keccak256(abi.encode(account, amount))
+        bytes32 root; // merkle root of keccak256(bytes.concat(keccak256(abi.encode(account, amount)))) (OZ double-hashed leaves)
         uint128 total;
         uint128 claimed;
         uint64 expiry; // after this, unclaimed stays in the vault for a later distribution

@@ -36,7 +36,9 @@ const permit2Abi = parseAbi(['function allowance(address,address,address) view r
 
 const ctx = () => {
   const a = addresses(); const v = V4[a.chainId]; if (!v) throw new Error(`swaps not configured for chain ${a.chainId}`);
-  if (!a.jig || !a.launchHook || !a.factory) throw new Error('JIG_TOKEN / JIG_LAUNCH_HOOK / COIN_FACTORY not set');
+  // COIN_FACTORY is only needed for coin routes: ETH <-> JIG must quote from the first block of the JIG window, before
+  // the coin side is deployed (pre-audit review, 16 Oct)
+  if (!a.jig || !a.launchHook) throw new Error('JIG_TOKEN / JIG_LAUNCH_HOOK not set');
   const c = CHAINS[a.chainId];
   return { a, v, pub: createPublicClient({ chain: c.chain, transport: http(c.rpc) }) };
 };
@@ -48,6 +50,7 @@ async function poolWithJig(pub, a, token) {
   if (token === ETH) return { key: jigPoolKey(a), kind: 'jig' };
   const collection = await pub.readContract({ address: token, abi: coinAbi, functionName: 'collection' }).catch(() => null);
   if (!collection) throw new Error(`${token} is not ETH, JIG or a Jigsaw creator coin`);
+  if (!a.factory) throw new Error('COIN_FACTORY not set: only ETH <-> JIG can be quoted yet');
   const coin = await pub.readContract({ address: a.factory, abi: factoryAbi, functionName: 'coinOf', args: [collection] });
   if (getAddress(coin) !== getAddress(token)) throw new Error(`${token} is not a Jigsaw creator coin`);
   return { key: await pub.readContract({ address: a.factory, abi: factoryAbi, functionName: 'keyOf', args: [collection] }), kind: 'coin' };
@@ -69,23 +72,27 @@ export async function route(from, to) {
   return { from, to, hops: [{ key: h1.key, kind: h1.kind, zeroForOne: getAddress(from) === getAddress(h1.key.currency0) }, { key: h2.key, kind: h2.kind, zeroForOne: getAddress(a.jig) === getAddress(h2.key.currency0) }], via: a.jig };
 }
 
-const pathOf = (r) => r.hops.map((h, i) => {
+// the allowlist proof (hookData) goes to the JIG pool hop: a two-hop ETH -> coin swap crosses it too, and without the
+// proof an allowlisted wallet paid the 60% window fee there (pre-audit review, 16 Oct)
+const pathOf = (r, hookData = '0x') => r.hops.map((h, i) => {
   const out = i === r.hops.length - 1 ? r.to : r.via;
-  return { intermediateCurrency: out, fee: h.key.fee, tickSpacing: h.key.tickSpacing, hooks: h.key.hooks, hookData: '0x' };
+  return { intermediateCurrency: out, fee: h.key.fee, tickSpacing: h.key.tickSpacing, hooks: h.key.hooks, hookData: h.kind === 'jig' ? hookData : '0x' };
 });
 
-/** Gross output for `amountIn`, from the V4 Quoter (eth_call; the quoter reverts internally by design). */
+/** Output for `amountIn` from the V4 Quoter (eth_call; the quoter reverts internally by design). Net of every pool and
+ *  hook fee on the route (the quoter runs the hooks); "gross" only of the platform's TAKE_PORTION, applied after. */
 export async function quoteGross(r, amountIn, hookData = '0x') {
   const { v, pub } = ctx();
   const data = r.hops.length === 1
     ? encodeFunctionData({ abi: quoterAbi, functionName: 'quoteExactInputSingle', args: [{ poolKey: r.hops[0].key, zeroForOne: r.hops[0].zeroForOne, exactAmount: amountIn, hookData }] })
-    : encodeFunctionData({ abi: quoterAbi, functionName: 'quoteExactInput', args: [{ exactCurrency: r.from, path: pathOf(r), exactAmount: amountIn }] });
+    : encodeFunctionData({ abi: quoterAbi, functionName: 'quoteExactInput', args: [{ exactCurrency: r.from, path: pathOf(r, hookData), exactAmount: amountIn }] });
   const res = await pub.call({ to: v.quoter, data });
   const [out] = decodeFunctionResult({ abi: quoterAbi, functionName: r.hops.length === 1 ? 'quoteExactInputSingle' : 'quoteExactInput', data: res.data });
   return out;
 }
 
 /** Universal Router calldata: swap, settle input, TAKE_PORTION fee to the platform, TAKE_ALL the rest to the user (>= minOut). */
+export { pathOf };
 export function calldata(r, amountIn, minOut, { bps, platform, deadline, hookData = '0x' }) {
   const swapAct = r.hops.length === 1 ? ACT.SWAP_EXACT_IN_SINGLE : ACT.SWAP_EXACT_IN;
   const acts = [swapAct, ACT.SETTLE_ALL, ...(bps > 0 ? [ACT.TAKE_PORTION] : []), ACT.TAKE_ALL];
@@ -94,7 +101,7 @@ export function calldata(r, amountIn, minOut, { bps, platform, deadline, hookDat
     ? encodeAbiParameters([{ type: 'tuple', components: [{ name: 'poolKey', ...keyTuple }, { name: 'zeroForOne', type: 'bool' }, { name: 'amountIn', type: 'uint128' }, { name: 'amountOutMinimum', type: 'uint128' }, { name: 'hookData', type: 'bytes' }] }],
         [{ poolKey: r.hops[0].key, zeroForOne: r.hops[0].zeroForOne, amountIn, amountOutMinimum: 0n, hookData }])
     : encodeAbiParameters([{ type: 'tuple', components: [{ name: 'currencyIn', type: 'address' }, { name: 'path', type: 'tuple[]', components: pathKeyTuple.components }, { name: 'amountIn', type: 'uint128' }, { name: 'amountOutMinimum', type: 'uint128' }] }],
-        [{ currencyIn: r.from, path: pathOf(r), amountIn, amountOutMinimum: 0n }]);
+        [{ currencyIn: r.from, path: pathOf(r, hookData), amountIn, amountOutMinimum: 0n }]);
   const settle = encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [r.from, amountIn]);
   const params = [swapParams, settle];
   if (bps > 0) params.push(encodeAbiParameters([{ type: 'address' }, { type: 'address' }, { type: 'uint256' }], [r.to, platform, BigInt(bps)]));

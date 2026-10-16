@@ -39,7 +39,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///   Anti-snipe: for SNIPE_WINDOW (seconds, pump-style) after launch the fee decays
 ///   linearly from SNIPE_FEE (60%) down to the chosen fee.
 ///
-/// Address must carry exactly BEFORE_INITIALIZE | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA
+/// Address must carry exactly BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA
 /// (0x2844) in its low 14 bits.
 contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
@@ -250,10 +250,6 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         return 10_000 - platformBps(feePips) - POT_BPS - DEEPEN_BPS;
     }
 
-    /// @notice Fold what `from` earned on this pool and left unclaimed for RECYCLE_AFTER back through the split.
-    ///         Anyone may call. Only this pool's creator or flywheel is recyclable, only for what they earned here,
-    ///         and the creator+flywheel block goes to the other side (creator's stale money feeds the flywheel,
-    ///         the flywheel's stale money feeds the pot), so recycling can never pay the party that let it go stale.
     /// @notice The factory calls this once its seed position is minted. From then on the pool accepts no liquidity
     ///         from anyone: an LP band inside the range would trade coin for JIG at spot with no fee and no anti-snipe.
     function seal(PoolKey calldata key) external {
@@ -263,6 +259,10 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         c.seeded = true;
     }
 
+    /// @notice Fold what `from` earned on this pool and left unclaimed for RECYCLE_AFTER back through the split.
+    ///         Anyone may call. Only this pool's creator or flywheel is recyclable, only for what they earned here,
+    ///         and the creator+flywheel block goes to the other side (creator's stale money feeds the flywheel,
+    ///         the flywheel's stale money feeds the pot), so recycling can never pay the party that let it go stale.
     function recycle(PoolKey calldata key, address from) external nonReentrant returns (uint256 amount) {
         PoolId id = key.toId();
         Config storage c = pools[id];

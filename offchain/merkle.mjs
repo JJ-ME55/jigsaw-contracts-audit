@@ -19,9 +19,11 @@ export function tree(leaves) {
   return { root: layers[layers.length - 1][0], layers };
 }
 
-export function proof(layers, leaf) {
+// `index` (leaf -> position) makes building every proof O(n log n); indexOf per leaf was O(n^2) and froze the server
+// for minutes on a large holder list (replica review, 17 Oct)
+export function proof(layers, leaf, index) {
   if (!layers.length) return null;
-  let idx = layers[0].indexOf(leaf); if (idx < 0) return null;
+  let idx = index ? (index.get(leaf) ?? -1) : layers[0].indexOf(leaf); if (idx < 0) return null;
   const out = [];
   for (let l = 0; l < layers.length - 1; l++) { const sib = idx ^ 1; if (sib < layers[l].length) out.push(layers[l][sib]); idx = Math.floor(idx / 2); }
   return out;
@@ -34,7 +36,8 @@ export function amountTree(allocations) {
   const entries = Object.entries(allocations).filter(([, v]) => BigInt(v) > 0n).map(([k, v]) => [getAddress(k), BigInt(v)]);
   const leaves = entries.map(([k, v]) => amountLeaf(k, v));
   const { root, layers } = tree(leaves);
+  const index = new Map((layers[0] ?? []).map((l, i) => [l, i]));
   const claims = {};
-  for (const [k, v] of entries) claims[k] = { amount: v.toString(), proof: proof(layers, amountLeaf(k, v)) };
+  for (let i = 0; i < entries.length; i++) { const [k, v] = entries[i]; claims[k] = { amount: v.toString(), proof: proof(layers, leaves[i], index) }; }
   return { root, total: entries.reduce((s, [, v]) => s + v, 0n).toString(), count: entries.length, claims };
 }

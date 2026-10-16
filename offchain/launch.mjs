@@ -1,6 +1,7 @@
 // Launch: create a collection through the audited factory on a chain that has one.
 // Mainnet is refused unless ALLOW_MAINNET=1 is set on the server, on purpose.
-import { createPublicClient, createWalletClient, http, parseAbi, parseEther, formatEther, decodeEventLog } from 'viem';
+import { createPublicClient, createWalletClient, http, parseAbi, parseEther, formatEther, decodeEventLog, encodeFunctionData } from 'viem';
+import { send as sendTx } from './sender.mjs';
 import { privateKeyToAccount } from 'viem/accounts';
 import { mainnet, sepolia } from 'viem/chains';
 import { ledger, load, save, list, update } from './store.mjs';
@@ -12,9 +13,9 @@ import path from 'node:path';
 import { buildDir } from './store.mjs';
 
 export const CHAINS = {
-  1: { chain: mainnet, rpc: process.env.RPC_URL ?? 'https://ethereum-rpc.publicnode.com', factory: process.env.MAINNET_FACTORY ?? null, name: 'Ethereum' },   // no default: 0x830c…e01a belongs to the retired burner
-  11155111: { chain: sepolia, rpc: 'https://ethereum-sepolia-rpc.publicnode.com', factory: process.env.SEPOLIA_FACTORY ?? null, name: 'Sepolia' },
-  4663: { chain: { id: 4663, name: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [process.env.RH_RPC ?? 'https://rpc.mainnet.chain.robinhood.com'] } } }, rpc: process.env.RH_RPC ?? 'https://rpc.mainnet.chain.robinhood.com', factory: process.env.RH_FACTORY ?? null, name: 'Robinhood Chain' },
+  1: { chain: mainnet, rpc: process.env.RPC_URL ?? 'https://ethereum-rpc.publicnode.com', factory: process.env.MAINNET_FACTORY ?? null, launcher: process.env.MAINNET_LAUNCHER ?? null, name: 'Ethereum' },   // no default: 0x830c…e01a belongs to the retired burner
+  11155111: { chain: sepolia, rpc: 'https://ethereum-sepolia-rpc.publicnode.com', factory: process.env.SEPOLIA_FACTORY ?? null, launcher: process.env.SEPOLIA_LAUNCHER ?? null, name: 'Sepolia' },
+  4663: { chain: { id: 4663, name: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [process.env.RH_RPC ?? 'https://rpc.mainnet.chain.robinhood.com'] } } }, rpc: process.env.RH_RPC ?? 'https://rpc.mainnet.chain.robinhood.com', factory: process.env.RH_FACTORY ?? null, launcher: process.env.RH_LAUNCHER ?? null, name: 'Robinhood Chain' },
 };
 const abi = parseAbi([
   'function CREATE_FEE() view returns (uint256)',
@@ -22,12 +23,16 @@ const abi = parseAbi([
   'event CollectionCreated(address indexed collection, address indexed owner, string name, uint256 maxSupply)',
 ]);
 
+const launcherAbi = [{ type: 'function', name: 'create', stateMutability: 'payable', inputs: [{ name: 'c', type: 'tuple', components: [{ name: 'name', type: 'string' }, { name: 'symbol', type: 'string' }, { name: 'maxSupply', type: 'uint256' }, { name: 'mintPriceWei', type: 'uint256' }, { name: 'maxPerWallet', type: 'uint256' }, { name: 'creator', type: 'address' }, { name: 'royaltyBps', type: 'uint96' }] }, { name: 'provenance', type: 'bytes32' }, { name: 'uri', type: 'string' }, { name: 'revealLater', type: 'bool' }], outputs: [{ type: 'address' }] }];
+
 // Shape matches the front end's LaunchOptions type: { chains: [{ chainId, name, factory }] }
 // Chains where real money moves. Launching on any of them needs ALLOW_MAINNET=1 (founders' rule 2).
 const MAINNETS = new Set([1, 4663]);
 const mainnetBlocked = (chainId) => MAINNETS.has(Number(chainId)) && process.env.ALLOW_MAINNET !== '1';
+// a mainnet also needs CollectionLauncher (provenance committed at creation); refused before any compose or pinning
+const needsLauncher = (chainId) => MAINNETS.has(Number(chainId)) && !CHAINS[Number(chainId)]?.launcher;
 export function launchOptions() {
-  const chains = Object.entries(CHAINS).map(([id, c]) => { const available = !!c.factory && !mainnetBlocked(id); return { chainId: Number(id), name: c.name, factory: available, available }; });
+  const chains = Object.entries(CHAINS).map(([id, c]) => { const available = !!c.factory && !mainnetBlocked(id) && !needsLauncher(id); return { chainId: Number(id), name: c.name, factory: available, available }; });
   return { chains };
 }
 
@@ -40,7 +45,7 @@ export async function canReceiveEth(chainId, address) {
   try { await pub.call({ account: from, to: address, value: 1n, stateOverride: [{ address: from, balance: 10n ** 18n }] }); return true; } catch { return false; }
 }
 
-export async function createCollection({ chainId, name, symbol, maxSupply, mintPriceEth = '0', maxPerWallet = 5, creator, royaltyBps = 500 }, { onSent } = {}) {
+export async function createCollection({ chainId, name, symbol, maxSupply, mintPriceEth = '0', maxPerWallet = 5, creator, royaltyBps = 500, provenance, uri, revealLater = false }, { onSent } = {}) {
   chainId = Number(chainId);   // "1" must not slip past the mainnet guard (15 Oct audit)
   const c = CHAINS[chainId]; if (!c) throw new Error('unknown chain');
   if (!c.factory) throw new Error(`no factory deployed on ${c.name} yet`);
@@ -51,28 +56,48 @@ export async function createCollection({ chainId, name, symbol, maxSupply, mintP
   const pk = process.env.LAUNCH_PK; if (!pk) throw new Error('LAUNCH_PK not set on the server');
   const account = privateKeyToAccount(pk);
   const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
-  const wallet = createWalletClient({ account, chain: c.chain, transport: http(c.rpc) });
   const fee = await pub.readContract({ address: c.factory, abi, functionName: 'CREATE_FEE' });
   const args = [name, symbol, BigInt(maxSupply), parseEther(String(mintPriceEth)), BigInt(maxPerWallet), creator, BigInt(royaltyBps)];
-  const hash = await wallet.writeContract({ address: c.factory, abi, functionName: 'createCollection', args, value: fee });
-  await onSent?.(hash);   // persisted before waiting, so a retry finds this contract instead of deploying a second one
+  // the hash is persisted before the broadcast (onSent), so a retry finds this contract instead of deploying a second one
+  // Through CollectionLauncher when the chain has one: the clone is created, its provenance and first URI committed and
+  // its ownership offered back to us in ONE transaction. Created directly, a clone is mintable at once and a single
+  // outside mint before setProvenanceHash blocks the commitment for good (replica review, 17 Oct). Required on mainnets.
+  let tx;
+  if (c.launcher) {
+    if (!provenance || !uri) throw new Error('provenance and the first URI are needed before the collection is created');
+    tx = { to: c.launcher, value: fee, data: encodeFunctionData({ abi: launcherAbi, functionName: 'create', args: [{ name, symbol, maxSupply: BigInt(maxSupply), mintPriceWei: parseEther(String(mintPriceEth)), maxPerWallet: BigInt(maxPerWallet), creator, royaltyBps: BigInt(royaltyBps) }, provenance, uri, !!revealLater] }) };
+  } else {
+    if (MAINNETS.has(chainId)) throw new Error(`no CollectionLauncher configured for ${c.name}: refusing to create a collection whose provenance could be blocked`);
+    tx = { to: c.factory, data: encodeFunctionData({ abi, functionName: 'createCollection', args }), value: fee };
+  }
+  const { hash } = await sendTx(chainId, tx, { onHash: (h) => onSent?.(h) });
   const collection = await collectionFromTx(chainId, hash);
   if (!collection) throw new Error(`deploy transaction ${hash} did not report a new collection`);
   ledger(`launch,${c.name},${collection},${name},${symbol},${maxSupply},${hash}`);
-  return { chainId, chainName: c.name, collection, owner: account.address, tx: hash, createFeeEth: formatEther(fee), mintPage: `/mint?chain=${chainId}&address=${collection}` };
+  return { chainId, chainName: c.name, collection, owner: account.address, tx: hash, viaLauncher: !!c.launcher, createFeeEth: formatEther(fee), mintPage: `/mint?chain=${chainId}&address=${collection}` };
 }
 
 // The collection a deploy transaction created (waits for it to be mined).
 export async function collectionFromTx(chainId, hash) {
   const c = CHAINS[Number(chainId)]; const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
   const r = await pub.waitForTransactionReceipt({ hash, timeout: 10 * 60_000 });
-  if (r.status !== 'success') throw new Error(`deploy transaction ${hash} failed on chain`);
+  if (r.status !== 'success') throw Object.assign(new Error(`deploy transaction ${hash} failed on chain`), { reverted: true });
   for (const l of r.logs) { try { const e = decodeEventLog({ abi, data: l.data, topics: l.topics }); if (e.eventName === 'CollectionCreated') return e.args.collection; } catch {} }
   return null;
 }
 
 // Owner calls on a freshly created clone: the launch wallet owns it, the creator earns from it.
-const cloneAbi = parseAbi(['function setProvenanceHash(bytes32)', 'function setBaseURI(string)', 'function setUnrevealedURI(string)', 'function setRevealSeed(bytes32)', 'function freezeMetadata()', 'function totalSupply() view returns (uint256)', 'function maxSupply() view returns (uint256)', 'function provenanceHash() view returns (bytes32)', 'function revealSeedSet() view returns (bool)']);
+const cloneAbi = parseAbi(['function setProvenanceHash(bytes32)', 'function setBaseURI(string)', 'function setUnrevealedURI(string)', 'function setRevealSeed(bytes32)', 'function freezeMetadata()', 'function totalSupply() view returns (uint256)', 'function maxSupply() view returns (uint256)', 'function provenanceHash() view returns (bytes32)', 'function revealSeedSet() view returns (bool)', 'function metadataFrozen() view returns (bool)', 'function baseURI() view returns (string)', 'function unrevealedURI() view returns (string)', 'function owner() view returns (address)', 'function pendingOwner() view returns (address)', 'function acceptOwnership()']);
+/** Stop minting on a collection (owner call). Used before an early reveal: revealing while minting is open would let
+ *  later minters see which art the next id gets and wait for a rare one (pre-audit review, 16 Oct). */
+export async function endMint(chainId, collection) {
+  const c = CHAINS[Number(chainId)]; const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
+  const abiP = parseAbi(['function paused() view returns (bool)', 'function pause()']);
+  if (await pub.readContract({ address: collection, abi: abiP, functionName: 'paused' })) return null;
+  const { hash } = await sendTx(chainId, { to: collection, data: encodeFunctionData({ abi: abiP, functionName: 'pause' }) });
+  return hash;
+}
+
 export async function readSupply(chainId, collection) {
   const c = CHAINS[Number(chainId)]; const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
   const [totalSupply, maxSupply] = await Promise.all([pub.readContract({ address: collection, abi: cloneAbi, functionName: 'totalSupply' }), pub.readContract({ address: collection, abi: cloneAbi, functionName: 'maxSupply' })]);
@@ -82,14 +107,26 @@ export async function configureClone(chainId, collection, { provenanceHash, base
   const c = CHAINS[chainId]; const account = privateKeyToAccount(process.env.LAUNCH_PK);
   const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) }); const wallet = createWalletClient({ account, chain: c.chain, transport: http(c.rpc) });
   const txs = {};
-  const send = async (fn, args) => { const hash = await wallet.writeContract({ address: collection, abi: cloneAbi, functionName: fn, args }); await pub.waitForTransactionReceipt({ hash }); txs[fn] = hash; };
+  // through the shared sender: one nonce at a time, and a reverted call throws instead of being recorded as done
+  const send = async (fn, args) => { const { hash } = await sendTx(chainId, { to: collection, data: encodeFunctionData({ abi: cloneAbi, functionName: fn, args }) }); txs[fn] = hash; };
+  // a collection made through CollectionLauncher offers us ownership (Ownable2Step): accept it first
+  const [owner, pending] = await Promise.all([pub.readContract({ address: collection, abi: cloneAbi, functionName: 'owner' }), pub.readContract({ address: collection, abi: cloneAbi, functionName: 'pendingOwner' }).catch(() => null)]);
+  if (owner.toLowerCase() !== account.address.toLowerCase()) {
+    if (pending && pending.toLowerCase() === account.address.toLowerCase()) await send('acceptOwnership', []);
+    else throw new Error(`the operating wallet does not own ${collection} (owner ${owner})`);
+  }
   const onChain = provenanceHash ? await pub.readContract({ address: collection, abi: cloneAbi, functionName: 'provenanceHash' }).catch(() => null) : null;
   if (provenanceHash && (!onChain || /^0x0+$/.test(onChain))) await send('setProvenanceHash', [provenanceHash]);
   else if (provenanceHash && onChain.toLowerCase() !== provenanceHash.toLowerCase()) throw new Error(`the collection already has a different provenance (${onChain}); not changing it`);
-  if (unrevealedURI) await send('setUnrevealedURI', [unrevealedURI]);
-  if (revealSeed) { const already = await pub.readContract({ address: collection, abi: cloneAbi, functionName: 'revealSeedSet' }).catch(() => false); if (!already) await send('setRevealSeed', [revealSeed]); }
-  if (baseURI) await send('setBaseURI', [baseURI]);
-  if (freeze) await send('freezeMetadata', []);
+  // every step is skipped when it is already on chain, so a retry after any interruption finishes instead of reverting
+  // (a reveal stopped after freezeMetadata could never complete: replica review, 17 Oct)
+  const read = (fn) => pub.readContract({ address: collection, abi: cloneAbi, functionName: fn });
+  const frozen = await read('metadataFrozen');
+  if (unrevealedURI && !frozen && (await read('unrevealedURI')) !== unrevealedURI) await send('setUnrevealedURI', [unrevealedURI]);
+  if (revealSeed && !(await read('revealSeedSet'))) await send('setRevealSeed', [revealSeed]);
+  if (baseURI && !frozen && (await read('baseURI')) !== baseURI) await send('setBaseURI', [baseURI]);
+  if (baseURI && frozen && (await read('baseURI')) !== baseURI) throw new Error('metadata is frozen with a different base URI; not changing it');
+  if (freeze && !frozen) await send('freezeMetadata', []);
   return txs;
 }
 
@@ -103,6 +140,7 @@ export function startLaunch(buildId, settings) {
   const c = CHAINS[settings.chainId]; if (!c) throw new Error('unknown chain');
   if (!c.factory) throw new Error(`no factory deployed on ${c.name} yet`);
   if (mainnetBlocked(settings.chainId)) throw new Error('mainnet launches are disabled on this server');
+  if (needsLauncher(settings.chainId)) throw new Error('no CollectionLauncher configured for this chain: set it before launching');
   if (!/^0x[0-9a-fA-F]{40}$/.test(String(settings.creator ?? ''))) throw new Error('connect the wallet that should receive the mint proceeds');
   if (!process.env.LAUNCH_PK) throw new Error('LAUNCH_PK not set on the server');
   // Pinning plan guard: the free Pinata tier allows 500 files, two per token. PIN_MAX_TOKENS lifts this once a plan is paid.
@@ -145,9 +183,11 @@ async function runLaunch(id) {
     const out = path.join(buildDir(id), `out_${size}`); const sym = (s.symbol || 'collection').toLowerCase();
     let { pinned, provenance, collection } = b.launch;
     if (!collection && b.launch.deployTx) {
-      // the deploy was sent before the failure: find the contract it made instead of deploying again
+      // the deploy was sent before the failure: find the contract it made instead of deploying again; a deploy that
+      // reverted on chain made nothing, so it is forgotten and sent again (replica review, 17 Oct)
       setStage(id, 'deploying');
-      collection = await collectionFromTx(s.chainId, b.launch.deployTx);
+      try { collection = await collectionFromTx(s.chainId, b.launch.deployTx); }
+      catch (e) { if (!e.reverted) throw e; b = setStage(id, 'deploying', { deployTx: null, revertedDeployTx: b.launch.deployTx }); }
       if (collection) b = setStage(id, 'configuring', { collection });
     }
     if (!pinned) {
@@ -174,20 +214,22 @@ async function runLaunch(id) {
       fs.writeFileSync(path.join(out, 'pinned.json'), JSON.stringify(pinned, null, 1));
       b = setStage(id, collection ? 'configuring' : 'deploying', { pinned, pinnedFor: pinKey(s), provenance });
     }
+    provenance = provenance ?? ('0x' + fs.readFileSync(path.join(out, 'provenance.txt'), 'utf8').trim());
+    const plan = planFromSettings(s);
+    // the placeholder is pinned BEFORE the collection exists: it is committed in the creating transaction
+    let placeholder = load(id).launch.placeholder;
+    if (plan && !placeholder) { placeholder = await withRetry('pinning placeholder', () => pinPlaceholder(id, { name: s.name })); setStage(id, collection ? 'configuring' : 'deploying', { placeholder }); }
     if (!collection) {
       b = setStage(id, 'deploying');
       const count = load(id).composed.count;
-      const created = await createCollection({ chainId: s.chainId, name: s.name, symbol: s.symbol, maxSupply: count, mintPriceEth: s.mintPriceEth ?? '0', maxPerWallet: s.maxPerWallet ?? 5, creator: s.creator, royaltyBps: s.royaltyBps ?? 500 },
+      const created = await createCollection({ chainId: s.chainId, name: s.name, symbol: s.symbol, maxSupply: count, mintPriceEth: s.mintPriceEth ?? '0', maxPerWallet: s.maxPerWallet ?? 5, creator: s.creator, royaltyBps: s.royaltyBps ?? 500,
+        provenance, uri: plan ? placeholder.uri : pinned.baseURI, revealLater: !!plan },
         { onSent: (hash) => { setStage(id, 'deploying', { deployTx: hash }); } });
       collection = created.collection;
       b = setStage(id, 'configuring', { ...created });
     }
-    provenance = provenance ?? ('0x' + fs.readFileSync(path.join(out, 'provenance.txt'), 'utf8').trim());
-    const plan = planFromSettings(s);
     if (plan) {
-      // Reveal later: commit the provenance now, show the placeholder, keep the base URI unset. reveal.mjs does the rest.
-      let placeholder = load(id).launch.placeholder;
-      if (!placeholder) { placeholder = await withRetry('pinning placeholder', () => pinPlaceholder(id, { name: s.name })); setStage(id, 'configuring', { placeholder }); }
+      // Reveal later: the provenance and the placeholder are committed; the base URI stays unset. reveal.mjs does the rest.
       const txs = await configureClone(s.chainId, collection, { provenanceHash: provenance, unrevealedURI: placeholder.uri });
       update(id, (d) => { d.status = 'launched'; d.launch = { ...d.launch, stage: 'live', provenance, baseURI: null, unrevealedURI: placeholder.uri, revealed: false, reveal: { ...plan, ...(d.launch.reveal?.state && d.launch.reveal.state !== 'waiting' ? d.launch.reveal : {}) }, configureTxs: txs, finishedAt: new Date().toISOString() }; });
       ledger(`${id},launch-live-unrevealed,${collection},${s.chainId},${placeholder.uri}`);
@@ -289,4 +331,17 @@ export async function upgradeWebBaseURI(id) {
     const d = load(id); d.launch.webBaseURI = { ...d.launch.webBaseURI, state: 'failed', error: e.message }; save(d);
     return 'failed: ' + e.message;
   }
+}
+
+// Collections made by our NFT factory are EIP-1167 clones of its implementation. CoinFactory is open to any contract
+// that names a creator, so the keeper and the vanity grinder serve only these (replica review, 17 Oct).
+const _ours = new Map();
+export async function isOurCollection(chainId, collection) {
+  const c = CHAINS[Number(chainId)]; if (!c?.factory) throw new Error('no NFT factory configured for this chain');
+  const k = `${chainId}:${String(collection).toLowerCase()}`; if (_ours.has(k)) return _ours.get(k);
+  const pub = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
+  const impl = await pub.readContract({ address: c.factory, abi: parseAbi(['function implementation() view returns (address)']), functionName: 'implementation' });
+  const code = await pub.getCode({ address: collection });
+  const ours = (code ?? '').toLowerCase() === `0x363d3d373d3d3d363d73${impl.slice(2).toLowerCase()}5af43d82803e903d91602b57fd5bf3`;
+  _ours.set(k, ours); return ours;
 }

@@ -14,23 +14,29 @@ Foundry project. Spec: `../ECONOMICS-DRAFT.md` (signed off 15 Oct 2026) and the 
 | Vesting | `0x9502d687eF97504b04cf4a9925bc31282Bf49C18` | linear vesting with cliff for any ERC-20, irrevocable. Deployed but unused since creator vesting was dropped (15 Oct) |
 | JIGLaunchHook | `0xfC44a44011d86Add3bC391934681F592cE222880` | the launch window: for 5 minutes after the pool opened, allowlisted tx.origin pays the normal 1.5%, anyone else 60%; then 1.5% for all. During those 5 minutes nobody but JIGLaunch can add liquidity, so a sniper cannot LP a band and earn their own tax back. Serves only the ETH/JIG dynamic-fee pool at the agreed spacing and start price, and only JIGLaunch may initialise it. CREATE2-mined address (flag bits 0x2880). This Sepolia deploy has no allowlist (everyone paid 60% in its window) |
 
+### NFT launch
+
+| Contract | Address | What it does |
+|---|---|---|
+| CollectionLauncher | `0xFde2d1d761a70A5b17E74431FE1a23D0C77FFB15` (17 Oct; factory `0xbE4d…F50F`, operator `0x7efa…5fDf`) | creates a collection through the Loom NFT factory and, in the same transaction, sets its provenance hash and first URI (the unrevealed placeholder, or the base URI for an immediate reveal), then `transferOwnership(operator)`; the operator calls `acceptOwnership()` (Ownable2Step). Only the operator may call `create()`; it holds nothing between calls. Why: a clone is mintable from creation and `setProvenanceHash` refuses once anything is minted, so one outside mint between two transactions blocked the launch for good (replica review, 17 Oct). Verified on Sepolia: collection `0xa61Ab77333F1a16569622ec511531d9A04013b35` created through it (tx `0xac097138…1023e0`), ownership accepted, revealed with drand round 33127545, frozen; a configure retry after the freeze sent nothing |
+
 Pool on Sepolia: ETH / JIG, dynamic fee via the hook, tick spacing 200, launched 15 Oct 2026 with the agreed parameters below. Earlier Sepolia sets are superseded and can be ignored.
 
 ## Launch plan (agreed by Jj and Fish, 15 Oct 2026)
 
 | | |
 |---|---|
-| Start FDV | about $4k, a pump.fun-style start: 1 ETH = 625,000,000 JIG at $2,500 ETH. Recompute the sqrt price from the live ETH price on launch day |
+| Start FDV | about $4k, a pump.fun-style start: `START_TICK` 202,400 is about 1 ETH = 616M JIG (~$4k at ETH ~$2,460). Set `START_TICK` from the live ETH price on launch day (a multiple of 200) |
 | Range | full range above the start price, single-sided JIG, no cap |
 | First 5 minutes | allowlisted friends-and-family wallets buy at the normal 1.5%; any other wallet pays a 60% fee (sniper tax) |
 | After 5 minutes | open to everyone, fee 1.5%. The LP is locked; collected fees split half to the team wallet, half to the pot. The 1.5% is also paid on the JIG leg of every coin buy from ETH |
-| Contract address | vanity prefix via a CREATE2 salt grind, on the final mainnet deploy only |
+| Contract address | `0x00000…c011ec7` through CreateX CREATE3 (salt bound to the JIG deployer, same address on every chain), `JIG_SALT`; see docs/JIG-VANITY.md |
 
 The window is `JIGLaunchHook`: `beforeInitialize` records the clock and refuses any pool other than ETH/JIG dynamic-fee; `beforeSwap` returns a 1.5% override for a tx.origin that proves allowlist membership in `hookData` (merkle proof, OpenZeppelin double-hash leaves of `abi.encode(address)`), 60% otherwise, 1.5% for all after 5 minutes. tx.origin is deliberate: routers can lie about msg.sender, nobody can fake the signing EOA. Smart-contract wallets therefore can't be allowlisted; use EOAs for the FNF list.
 
 **Allowlist root:** build the tree off chain (OpenZeppelin `merkletreejs` or `@openzeppelin/merkle-tree` with `["address"]` leaves), pass the root as `ALLOWLIST_ROOT` to the deploy script, and give each friend their proof for the front end to pass as hookData. The root is fixed once the pool exists.
 
-Pot owner is the operating wallet for now. Before mainnet it must be a 2-of-2 multisig of both founders.
+On Sepolia the pot owner is the operating wallet. On Robinhood it is the founders' Safe (`POT_OWNER`, required by the script there).
 
 Deploy cost on Sepolia: 0.000032 test ETH across six transactions, plus about 0.00002 wasted on two failed attempts (see gotcha below).
 
@@ -48,7 +54,7 @@ Foundry 1.8.3, solc 0.8.26, via-ir, cancun. v4-periphery was installed from its 
 ## Tests
 
 ```bash
-forge test                                              # 14 unit tests: JIG, Vesting, PotVault
+forge test --fork-url sepolia                            # 118 tests (unit + Sepolia fork), incl. low-JIG reruns of the flywheel and regression suites
 forge test --match-contract Fork --fork-url sepolia     # 11 tests on a Sepolia fork: launch, lock, real buys, window fees, sniper tax to pot
 ```
 
@@ -63,7 +69,9 @@ set -a; . ../backend/.env; set +a
 forge script script/DeployJIG.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
 ```
 
-Reads `LAUNCH_PK` (deployer and launcher) and optional `POT_OWNER`. Refuses chain id 1. Robinhood Chain needs its v4 PositionManager and Permit2 addresses added to `_v4()` first.
+Every script refuses Ethereum and Robinhood Chain (4663) unless `ALLOW_MAINNET_DEPLOY=1`; on those chains each role is required (DeployJIG: `POT_OWNER`, `PLATFORM`, `ALLOWLIST_ROOT`, `JIG_SALT`; DeployPayouts: `PAYOUTS_OWNER`; DeployCoins: `PLATFORM`, `LAUNCH_FEE_WEI`, `AIRDROP_OWNER`; DeployDeepening: `KEEPER`). Robinhood's Uniswap v4 addresses are in each script's `_v4()`. The whole go-day sequence is rehearsed on a local Robinhood fork by `script/rehearse-mainnet.sh` (roles read back from chain; it does not yet cover the NFT factory or CollectionLauncher).
+
+**CollectionLauncher** comes right after the NFT factory (`backend/scripts/deploy-nft-factory.mjs`): `NFT_FACTORY=<factory> OPERATOR=<operating wallet> forge script script/DeployLauncher.s.sol --rpc-url <chain> --broadcast --slow --skip-simulation`. Both are required on every chain; the script checks the factory has code. Then set `RH_LAUNCHER` (or `SEPOLIA_LAUNCHER`, `MAINNET_LAUNCHER`) on the server. The server refuses to create a collection on Ethereum or Robinhood without one.
 
 **Gotcha, Sepolia gas:** contract creation on Sepolia now costs about 8x what Foundry's local simulation computes (a 144-byte contract: 65k simulated, 497k real). Without `--skip-simulation` forge sets the gas limit from its own simulation and every deploy fails with all gas consumed and no revert reason. `--skip-simulation` makes it ask the node. Expect the same on any chain that has had the 2026 gas repricing.
 
@@ -199,13 +207,46 @@ Four specialists (math, permissions, economics, control flow) and a judge, 38 mi
 | 3 | Info | a buy too small to owe any JIG was still charged its coin fee into `pendingCoin` | charged nothing | `Regressions::test_dust_buy_is_charged_nothing` |
 | 4 | Info | `donate()` is allowed on creator pools and the donation accrues to the factory's locked position with no collect path | accepted, residual trust: only the donor loses; gating it means another re-mine (bits 0x2864) for no user benefit | |
 
+## Replica review, 17 Oct 2026
+
+A review of the whole base, contracts and the back end's money paths together. Contracts: 118 tests pass. Back end: 59 tests pass.
+
+| Severity | Finding | Fix | Test |
+|---|---|---|---|
+| Medium | a clone is mintable from creation and `setProvenanceHash` refuses once anything is minted, so one outside mint between the create and the commit blocked a launch for good (never happened live) | `CollectionLauncher`: create, provenance and first URI in one transaction, ownership offered to the operator; the server goes through it where configured and refuses mainnets without it | `CollectionLauncher.fork.t.sol` (the old two-step launch blocked by one mint; the launcher commits before any mint) |
+| Low | `HolderDrip`'s first pull spread over the supply at that pull, so tokens minted after fees accrued shared JIG earned before they existed | `lastSupply` recorded in the constructor: the first pull spreads over the tokens that existed when the module went live | `HolderDripFirstPull.t.sol` |
+
+Back-end findings, fixed in the same pass:
+
+| Finding | Fix |
+|---|---|
+| a reveal interrupted after `freezeMetadata` could never finish (every retry reverted) | `configureClone` accepts pending ownership first and skips every step already on chain |
+| a deploy that reverted on chain blocked the launch's retry | the reverted hash is forgotten and the deploy is sent again |
+| CoinFactory is open to any contract that names a creator, so a hostile collection could stall the keeper or fill the vanity queue | the keeper and the COLLECT grind serve only EIP-1167 clones of our NFT factory's implementation (`isOurCollection`); others get vanity `unavailable` |
+| the keeper trusted a module's own `undistributed()`, quoted min-out minutes before the send, had no gas bound, and a flat daily cap starved newer coins | drip amount from the hook's claimable and the JIG balance only; min-out re-quoted right before the send; gas = estimate x1.3, refused above `KEEPER_GAS_CAP` (3,000,000); daily cap `KEEPER_MAX_TX_PER_DAY` + `KEEPER_TX_PER_COIN` per serviced coin |
+| an unknown JIG price skipped a whole payout window when `minRoundUsd` > 0; a lagging node's missing receipt was called "replaced" at once | the round waits for the next pass; "replaced" only after 3 passes |
+| snapshots indexed to `latest` (a reorg leaves phantom balances); the platform fee wallet counted as a coin holder; no size limit; proofs O(n²) | index to the `safe` block; `PLATFORM_ADDRESS` excluded; `PAYOUT_MAX_HOLDERS` (200,000) and `AIRDROP_MAX_NFTS` (50,000) refuse larger snapshots; proofs O(n log n) |
+| allowlist additions after the root was on the hook broke every proof | refused once the hook has a root; proofs withheld if the file no longer builds the on-chain root |
+| `creatorOf` fell back to `owner()` on a zero `creator()` or an RPC error, unlike CoinFactory | follows CoinFactory exactly: `creator()` if it answers (zero = nobody, 403); `owner()` only if `creator()` does not exist; an RPC error is an error |
+| an early reveal timed its seed round from the server clock after the mint pause, which nobody outside could check | the seed is the first drand round after the later of the trigger and the block that confirmed the pause (`pausedUnix` recorded) |
+
+## Known risks (founders' decision pending)
+
+**The operating wallet owns HolderPayouts and AirdropClaim on the mainnet plan.** It is a hot key on the server. If it leaks, it can declare a one-leaf round paying itself every coin's undeclared holder JIG (`declare` takes any root up to `balance[coin]`), and set a one-leaf drop paying itself the 5% airdrop of every coin whose drop is not yet set (`setDrop`, until someone sweeps it to the pot after 7 days). Round 1 accepted owner-declared roots only on the condition that the owner is the founders' multisig; this plan breaks that condition. Options:
+
+1. A guardian (the Safe) and a 12 to 24 h delay before a root becomes claimable, with cancel. Contract change, re-test, re-audit.
+2. Owner = the Safe; rounds and drops declared by Safe transaction. No automation.
+3. Accept, with key hygiene.
+
+Recommendation to put to Jj: option 1. Must be decided before go-live.
+
 ## Audit status
 
 **Plan of record, 15 Oct 2026 (Jj):** build the whole contract base on Sepolia first, no audits during the build. Then push the contracts to a throwaway public repo, have the IMD swarm audit the full base from it (the swarm cannot read a private repo and refuses requests with source embedded), fix findings, re-audit, launch nothing, delete the throwaway repo after sign-off. A single 0.5 IMD job can carry several agents, so the brief asks for two independent reviews of the repo inside the job, with the output a compiled list of each reviewer's findings and fixes. When everything has passed, tell Fish the back end is ready and go to mainnet in one sequence: JIG, then the NFT factory, then the creator-coin side. Then make the repo private again. External audit deferred; the fee hook and factory carry every coin's money, so that stays the main open risk.
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 71 passing tests (14 unit, 57 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4 (job ae115cf4, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 5 info; all fixed. Round 5 (job 374e2a1a): 1 High, 1 Medium, 2 Low, 1 Info, every one in round-4 code, all fixed. Round 6 (job b47cb5dc): no critical/high/medium, 1 Low (pre-existing drip timing), 3 Info, all fixed or accepted (section above); 71 tests | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 71 passing tests (14 unit, 57 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4 (job ae115cf4, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 5 info; all fixed. Round 5 (job 374e2a1a): 1 High, 1 Medium, 2 Low, 1 Info, every one in round-4 code, all fixed. Round 6 (job b47cb5dc): no critical/high/medium, 1 Low (pre-existing drip timing), 3 Info, all fixed or accepted (section above); 71 tests. Pre-audit review fixes (16 Oct): 112 tests. Replica review fixes (17 Oct, section above): 118 tests | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
@@ -236,7 +277,7 @@ Design notes an auditor should know:
 - **The early max-wallet from the spec is not built.** The decaying 60% fee is the anti-snipe measure.
 - **hook.setFactory is one-shot**, because the hook and factory reference each other.
 
-Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop, sweep, buyback and deepening end to end; `RegressionsFork` pins the review fixes. 53 tests in all. on a Sepolia fork: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
+Tests: `forge test --match-contract CreatorCoinFork --fork-url sepolia` runs 9 end-to-end tests; `FlywheelsFork` runs the drip, airdrop, sweep, buyback and deepening end to end; `RegressionsFork` pins the review fixes. 118 tests in all (`forge test --fork-url sepolia`). On a Sepolia fork they cover: launch and lock, supply split, the snipe decay, a buy with coin-side fee converted to JIG and split seven ways, a sell with the fee in JIG, referral defaults, the 5% band, pull claims, lower-only fee changes.
 
 Deploy: `script/DeployCoins.s.sol` (hook + factory, CREATE2-mined; `SALT_SEED` to redeploy with identical args), `script/DeployRest.s.sol` (AirdropClaim) and `script/DeployDeepening.s.sol` (LPDeepening + binding; `KEEPER`), all driven by env vars.
 

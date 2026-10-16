@@ -32,7 +32,9 @@ contract DeployDeepening is Script {
         });
 
         vm.startBroadcast(pk);
-        LPDeepening deep = new LPDeepening(hook, posm, permit2, jigPool, vm.envOr("KEEPER", vm.addr(pk)));
+        // KEEPER runs run(minEthOut): the operating wallet. Immutable, so required on a mainnet.
+        address keeper = (block.chainid == 1 || block.chainid == 4663) ? vm.envAddress("KEEPER") : vm.envOr("KEEPER", vm.addr(pk));
+        LPDeepening deep = new LPDeepening(hook, posm, permit2, jigPool, keeper);
         CreatorFeeHook(hook).setDeepening(address(deep));
         vm.stopBroadcast();
 

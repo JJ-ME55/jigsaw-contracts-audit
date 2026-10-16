@@ -20,3 +20,4 @@ remappings = [
 
 [rpc_endpoints]
 sepolia = "https://ethereum-sepolia-rpc.publicnode.com"
+robinhood = "https://rpc.mainnet.chain.robinhood.com"

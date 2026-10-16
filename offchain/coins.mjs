@@ -7,7 +7,7 @@ import { addresses, jigPrice } from './jig.mjs';
 import { readPool } from './v4state.mjs';
 import { list } from './store.mjs';
 
-const EXPLORER = { 11155111: 'https://sepolia.etherscan.io', 1: 'https://etherscan.io', 4663: 'https://explorer.chain.robinhood.com' };
+const EXPLORER = { 11155111: 'https://sepolia.etherscan.io', 1: 'https://etherscan.io', 4663: 'https://robinhoodchain.blockscout.com' } // Blockscout, from the chain registry (the old host does not resolve, checked 16 Oct);
 
 const keyType = { type: 'tuple', components: [{ name: 'currency0', type: 'address' }, { name: 'currency1', type: 'address' }, { name: 'fee', type: 'uint24' }, { name: 'tickSpacing', type: 'int24' }, { name: 'hooks', type: 'address' }] };
 const coinAbi = parseAbi(['function name() view returns (string)', 'function symbol() view returns (string)', 'function decimals() view returns (uint8)', 'function totalSupply() view returns (uint256)', 'function collection() view returns (address)']);
@@ -81,7 +81,9 @@ export async function coin(addr) {
   let site = null;
   try {
     const b = list().find((x) => x.launch?.collection && getAddress(x.launch.collection) === getAddress(collection));
-    if (b) site = { buildId: b.id, name: b.launch.settings?.name ?? b.input?.name, mintPage: `/mint/${b.launch.settings?.chainId}/${b.launch.collection}`, sampleImage: `/files/${b.id}/out_512/images/1.png`, revealed: b.launch.revealed ?? true };
+    if (b) site = { buildId: b.id, name: b.launch.settings?.name ?? b.input?.name, mintPage: `/mint/${b.launch.settings?.chainId}/${b.launch.collection}`, sampleImage: null, revealed: !b.launch.reveal || b.launch.reveal.state === 'done' || b.launch.revealed === true };
+    // no art before the reveal: a sample image would leak which art exists ahead of the drand-seeded order
+    if (site && site.revealed) site.sampleImage = `/files/${b.id}/out_512/images/1.png`;
   } catch {}
 
   const value = {

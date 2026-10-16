@@ -19,14 +19,17 @@ interface ICreateX {
 
 /// Phase 1 deploy: PotVault, JIGLaunch, JIG, Vesting, the launch hook, then the fair launch.
 ///
-/// Sepolia only. ALLOW_MAINNET stays 0 in the back end and this script refuses
-/// chain id 1. Robinhood Chain needs its v4 PositionManager/Permit2 addresses
-/// filled in before it can run there.
+/// Sepolia, and Robinhood Chain (4663) on the written go only: Ethereum and Robinhood are refused unless
+/// ALLOW_MAINNET_DEPLOY=1, and there POT_OWNER, PLATFORM, ALLOWLIST_ROOT and JIG_SALT are required (no defaults).
+/// Run with LAUNCH_PK = the JIG deployer key (JIG_DEPLOYER_PK): its address is inside JIG_SALT.
 ///
-/// Launch plan (agreed 15 Oct 2026, see README):
-///   start price 1 ETH = 625,000,000 JIG (1B supply => 1.6 ETH fully diluted, ~$4k, a pump.fun-style start)
+/// Launch plan (agreed 15-16 Oct 2026, see README and docs/MAINNET-PLAN.md):
+///   start price from START_TICK (default 202,400, about 1 ETH = 616M JIG, ~$4k FDV at ETH ~$2,460); set it from
+///     the day's ETH price: JIG per ETH = 1.0001^START_TICK, a multiple of 200
 ///   seeded range: full range above the start price, single-sided JIG, no cap
-///   first 10 minutes: allowlisted wallets pay 1%, everyone else 60%, all to the pot; then 1% for all
+///   first 5 minutes: allowlisted wallets pay 1.5%, everyone else 60%; then 1.5% for all; LP fees half team, half pot
+///   if any transaction after JIG's CreateX deploy fails, do NOT rerun (the vanity address is taken): finish by hand
+///     against the deployed JIGLaunch (docs/MAINNET-PLAN.md, "If the JIG deploy stops halfway")
 ///
 /// Usage:
 ///   set -a; . ../backend/.env; set +a
@@ -40,8 +43,11 @@ interface ICreateX {
 /// --crosschain 0 --matching 000000XXXXXXXXXXXXXXXXXXXXXXXXXXXc011ec7
 contract DeployJIG is Script {
     int24 constant TICK_SPACING = 200;
-    int24 constant TICK_UPPER = 202_400; // the start tick: price = TickMath.getSqrtPriceAtTick(TICK_UPPER), about 1 ETH = 616M JIG, ~$4k FDV
-    uint160 SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER); // range top == start price, so the first buy is at the start price
+    // The start tick: price = TickMath.getSqrtPriceAtTick(start), JIG per ETH = 1.0001^start. Default 202,400 is about
+    // 616M JIG per ETH (~$4k FDV at ETH ~$2,460). On launch day set START_TICK from that day's ETH price (a multiple
+    // of 200). The range top equals the start price, so the first buy is at the start price.
+    int24 TICK_UPPER;
+    uint160 SQRT_PRICE;
     int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
@@ -53,17 +59,25 @@ contract DeployJIG is Script {
         if (block.chainid == 1 || block.chainid == 4663) require(vm.envOr("ALLOW_MAINNET_DEPLOY", false), "mainnet deploy refused: set ALLOW_MAINNET_DEPLOY=1 only after both founders said go in writing");
         (address posm, address permit2, address poolManager) = _v4(block.chainid);
 
-        uint256 pk = vm.envUint("LAUNCH_PK");
+        uint256 pk = vm.envUint("LAUNCH_PK"); // the JIG deployer (JIG_DEPLOYER_PK): its address is inside JIG_SALT
         address deployer = vm.addr(pk);
-        address potOwner = vm.envOr("POT_OWNER", deployer);
-        address platform = vm.envOr("PLATFORM", deployer);
-        bytes32 root = vm.envOr("ALLOWLIST_ROOT", bytes32(0));
+        bool mainnet = block.chainid == 1 || block.chainid == 4663;
+        // On a mainnet every role is required: a silent default to the deployer would make a hot key the payee forever
+        address potOwner = mainnet ? vm.envAddress("POT_OWNER") : vm.envOr("POT_OWNER", deployer); // the Safe
+        address platform = mainnet ? vm.envAddress("PLATFORM") : vm.envOr("PLATFORM", deployer); // the Safe: team half of JIG pool fees
+        bytes32 root = mainnet ? vm.envBytes32("ALLOWLIST_ROOT") : vm.envOr("ALLOWLIST_ROOT", bytes32(0));
+        if (mainnet) require(root != bytes32(0), "ALLOWLIST_ROOT is required on a mainnet");
+        if (mainnet) require(vm.envOr("JIG_SALT", bytes32(0)) != bytes32(0), "JIG_SALT is required on a mainnet (the vanity address)");
+        TICK_UPPER = int24(vm.envOr("START_TICK", int256(202_400)));
+        require(TICK_UPPER % TICK_SPACING == 0 && TICK_UPPER > 0, "START_TICK must be a positive multiple of 200");
+        SQRT_PRICE = TickMath.getSqrtPriceAtTick(TICK_UPPER);
 
         vm.startBroadcast(pk);
         PotVault pot = new PotVault(potOwner);
         JIGLaunch launch = new JIGLaunch(posm, permit2, deployer, address(pot), platform);
         JIG jig = _deployJig(deployer, address(launch), address(pot));
-        Vesting vesting = new Vesting();
+        // Vesting is unused since creator vesting was dropped (15 Oct): not deployed on a mainnet
+        Vesting vesting = mainnet ? Vesting(address(0)) : new Vesting();
         launch.setJig(address(jig));
 
         bytes memory args = abi.encode(poolManager, address(jig), deployer, address(launch), SQRT_PRICE, TICK_SPACING);

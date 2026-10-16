@@ -16,9 +16,9 @@ interface IERC721Supply is IERC721 {
 ///         paid to the collection's NFT holders pro rata, per token, claimable (pull).
 ///         One instance per coin; its address is the `flywheel` passed to CoinFactory.
 ///
-///         Paid in JIG, which is what the fee hook holds. Each pull is a checkpoint:
-///         {supply at the pull, accumulator before it}. A token only earns from pulls
-///         made while it existed. The collection must mint sequential ids from 1 and
+///         Paid in JIG, which is what the fee hook holds. Each pull spreads what arrived since the previous pull
+///         over the supply recorded at that previous pull, and records a checkpoint {that supply, accumulator before
+///         it}. A token earns from the second pull after its mint: JIG that accrued before it existed is not its. The collection must mint sequential ids from 1 and
 ///         never decrease totalSupply (LoomCollection does both: firstTokenId = totalSupply + 1, totalSupply is a
 ///         monotone counter; see reference/LoomCollection.sol). A 0-based collection would over-claim here. Tokens sent to the dead
 ///         address can be marked burned so later pulls split among live tokens only; their
@@ -46,7 +46,7 @@ contract HolderDrip is ReentrancyGuard {
     uint256 public accounted; // JIG ever distributed into accPerToken
     uint256 public paidOut; // JIG ever paid to holders or swept to the pot
     uint256 public burnedCount; // burned tokens among the eligible supply
-    uint256 public lastSupply; // collection supply at the previous pull: the supply this pull's JIG is spread over
+    uint256 public lastSupply; // collection supply at the previous pull (or at deployment): the supply this pull's JIG is spread over
     uint256[] private _burnedAbove; // burned before they were ever eligible; folded into burnedCount once lastSupply covers them
     Checkpoint[] public checkpoints;
     mapping(uint256 tokenId => uint256) private _paidPerToken;
@@ -67,6 +67,9 @@ contract HolderDrip is ReentrancyGuard {
         jig = hook.jig();
         pot = hook.pot();
         collection = IERC721Supply(collection_);
+        // the supply when the module goes live: the first pull spreads over these tokens, not over tokens minted
+        // after fees accrued (replica review, 17 Oct)
+        lastSupply = collection.totalSupply();
     }
 
     /// @notice JIG held that has not yet been distributed into the accumulator.
@@ -78,13 +81,15 @@ contract HolderDrip is ReentrancyGuard {
     function pull() external nonReentrant returns (uint256 amount) {
         hook.claim();
         amount = undistributed();
-        // Spread over the supply the previous pull recorded, not today's: JIG that accrued since then belongs to the
-        // tokens that existed then. A token minted since starts earning from the next pull (swarm audit 6). The
-        // first pull uses the current supply.
-        uint256 supply = lastSupply == 0 ? collection.totalSupply() : lastSupply;
+        // Spread over the supply the previous pull recorded (the constructor records the first), not today's: JIG
+        // that accrued since then belongs to the tokens that existed then. A token minted since starts earning from
+        // the next pull (swarm audit 6; first pull, replica review 17 Oct).
+        uint256 supply = lastSupply;
         uint256 current = collection.totalSupply();
         lastSupply = current;
-        _foldBurns(current);
+        // count only burns this pull's supply contains; a token minted after the previous pull and burned since is
+        // folded in by the pull that spreads over it (pre-audit review, 16 Oct: folding by `current` over-promised)
+        _foldBurns(supply);
         uint256 live = supply > burnedCount ? supply - burnedCount : 0;
         if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
         checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));

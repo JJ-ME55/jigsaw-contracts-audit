@@ -13,6 +13,9 @@ const probe = createPublicClient({ transport: http(rpc) }); const chainId = awai
 if ((chainId === 1 || chainId === 4663) && process.env.ALLOW_MAINNET_DEPLOY !== '1') throw new Error('mainnet deploy refused: set ALLOW_MAINNET_DEPLOY=1 only after both founders said go in writing');
 const chain = { id: chainId, name: `chain-${chainId}`, nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [rpc] } } };
 const pub = createPublicClient({ chain, transport: http(rpc) }); const wallet = createWalletClient({ account, chain, transport: http(rpc) });
+// on a mainnet every role is required: a silent default to the deployer would make a hot key the payee for good
+const mainnet = chainId === 1 || chainId === 4663;
+for (const k of ['PLATFORM', 'RESERVE', 'PAUSER']) if (mainnet && !process.env[k]) throw new Error(`${k} is required on a mainnet`);
 const [platform, reserve, pauser] = ['PLATFORM', 'RESERVE', 'PAUSER'].map((k) => getAddress(process.env[k] ?? account.address));
 
 async function deploy(label, code, types, args) {

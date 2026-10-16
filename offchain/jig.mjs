@@ -3,9 +3,10 @@
 // never on a mainnet without ALLOW_MAINNET=1. Addresses come from the environment (see API.md "Coins").
 import fs from 'node:fs';
 import path from 'node:path';
-import { createPublicClient, createWalletClient, http, keccak256, encodeAbiParameters, concat, parseAbi, getAddress, isAddress, formatEther, getContractAddress } from 'viem';
+import { createPublicClient, encodeFunctionData, http, keccak256, encodeAbiParameters, concat, parseAbi, getAddress, isAddress, formatEther } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { CHAINS } from './launch.mjs';
+import { CHAINS, isOurCollection } from './launch.mjs';
+import { send as sendTx } from './sender.mjs';
 import { DATA } from './store.mjs';
 import { ethPrice } from './builds.mjs';
 import { poolIdOf, readPool, priceOf } from './v4state.mjs';
@@ -90,25 +91,38 @@ export function verify(root, address, proof) {
 }
 
 export function allowlist() { const l = readList(); const { root } = buildTree(l.addresses); return { count: l.addresses.length, frozen: !!l.frozen, root, addresses: l.addresses }; }
-export function addToAllowlist(list) {
+// The root on the hook, or null when none is set yet (or no hook is configured). On a mainnet DeployJIG sets the root,
+// not the server, so the file's `frozen` flag is never set there: the chain is the authority (replica review, 17 Oct).
+const ZERO32 = '0x' + '0'.repeat(64);
+async function hookRoot() {
+  const a = addresses(); if (!a.launchHook) return null;
+  const r = await pub().readContract({ address: a.launchHook, abi: launchHookAbi, functionName: 'allowlistRoot' });
+  return r === ZERO32 ? null : r;
+}
+export async function addToAllowlist(list, { rootOnChain = hookRoot } = {}) {
   const l = readList();
   if (l.frozen) throw new Error('allowlist is frozen: the root was set on the hook');
+  if (await rootOnChain()) throw new Error('allowlist is closed: its root is already on the hook, so an addition would break every proof');
   const add = (Array.isArray(list) ? list : [list]).filter(isAddress).map(getAddress);
   l.addresses = [...new Set([...l.addresses.map(getAddress), ...add])];
   writeList(l);
   return allowlist();
 }
-export function proof(address) { return proofFor(readList().addresses, address); }
+/** A proof, served only if the list still builds the root on the hook (when one is set). */
+export async function proof(address, { rootOnChain = hookRoot } = {}) {
+  const l = readList(); const chain = await rootOnChain();
+  if (chain && buildTree(l.addresses).root?.toLowerCase() !== chain.toLowerCase()) throw new Error('the allowlist file does not match the root on the hook; proofs are withheld until it is restored');
+  return proofFor(l.addresses, address);
+}
 
-/// Set the root on the hook (owner key = LAUNCH_PK, the deployer). Sepolia only unless ALLOW_MAINNET=1. Freezes the file.
+/// Set the root on the hook. Works only where the server's LAUNCH_PK owns the hook (Sepolia); on a mainnet the JIG
+/// deployer owns it and DeployJIG sets ALLOWLIST_ROOT. Freezes the file.
 export async function setRoot() {
   const a = addresses(); if (!a.launchHook) throw new Error('JIG_LAUNCH_HOOK not set');
   if (MAINNETS.has(a.chainId) && process.env.ALLOW_MAINNET !== '1') throw new Error('mainnet is disabled on this server');
   const l = readList(); const { root } = buildTree(l.addresses); if (!root) throw new Error('allowlist is empty');
-  const c = CHAINS[a.chainId]; const account = privateKeyToAccount(process.env.LAUNCH_PK);
-  const wallet = createWalletClient({ account, chain: c.chain, transport: http(c.rpc) });
-  const hash = await wallet.writeContract({ address: a.launchHook, abi: launchHookAbi, functionName: 'setAllowlist', args: [root] });
-  await pub().waitForTransactionReceipt({ hash });
+  // through the shared sender (one nonce queue with the keeper, launches and reveals; throws on a revert)
+  const { hash } = await sendTx(a.chainId, { to: a.launchHook, data: encodeFunctionData({ abi: launchHookAbi, functionName: 'setAllowlist', args: [root] }) });
   l.frozen = true; l.root = root; l.setTx = hash; writeList(l);
   return { root, tx: hash, count: l.addresses.length };
 }
@@ -152,8 +166,7 @@ export async function jigPrice() {
 
 // ---------------- creator-coin launch parameters ----------------
 // Start price and single-sided range for a coin on the collection, in the shape CoinFactory.launch wants. The coin's
-// address is the factory's next CREATE address, which decides the currency ordering; the quote is only valid while
-// nobody else launches first, so the front end re-asks right before sending.
+// address (CREATE2, below) decides the currency ordering against JIG.
 const TICK_SPACING = 200; const MAX_TICK = 887_200;
 // The coin's address comes from CREATE2 with a salt bound to the collection, ground so it ends in COLLECT (vanity.mjs).
 // It depends on name and symbol, so the site asks with them; while the grind runs the answer is { ready: false,
@@ -168,7 +181,10 @@ export async function launchParams(collection, { name, symbol, vanity: wantVanit
     p.readContract({ address: a.factory, abi: factoryAbi, functionName: 'coinOf', args: [getAddress(collection)] }),
   ]);
   if (existing !== '0x0000000000000000000000000000000000000000') throw new Error(`collection already has a coin: ${existing}`);
-  let v = wantVanity ? vanity.request(collection, name, symbol) : { state: 'off' };
+  // the grinder serves only collections our NFT factory made: anyone could otherwise fill its queue with random
+  // addresses and push real creators to 'busy' (replica review, 17 Oct)
+  let ours = false; try { ours = await isOurCollection(a.chainId, collection); } catch {}
+  let v = !wantVanity ? { state: 'off' } : ours ? vanity.request(collection, name, symbol) : { state: 'unavailable', reason: 'the COLLECT ending is ground only for collections made here' };
   if (v.state === 'grinding' || v.state === 'queued') return { ready: false, vanity: v, retryAfterSeconds: 3 };
   const salt = v.state === 'ready' ? v.salt : vanity.plainSalt(collection);
   const predicted = await p.readContract({ address: a.factory, abi: factoryAbi, functionName: 'predictCoin', args: [getAddress(collection), name, symbol, salt] });

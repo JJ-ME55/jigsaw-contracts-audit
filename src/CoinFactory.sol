@@ -244,7 +244,6 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         return launches[index].key;
     }
 
-    /// @notice The pool key of a collection's coin (zero key if none launched).
     /// @notice keccak256 of the coin's init code for this collection, name and symbol: what a CREATE2 salt grinder needs.
     function coinInitCodeHash(address collection, string calldata name, string calldata symbol) public view returns (bytes32) {
         return keccak256(abi.encodePacked(type(CreatorCoin).creationCode, abi.encode(name, symbol, SUPPLY, collection, address(this))));
@@ -256,6 +255,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         return address(uint160(uint256(h)));
     }
 
+    /// @notice The pool key of a collection's coin (zero key if none launched).
     function keyOf(address collection) external view returns (PoolKey memory) {
         return _keyOf[collection];
     }

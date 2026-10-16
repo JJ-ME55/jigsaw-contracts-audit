@@ -88,7 +88,6 @@ contract JIGLaunchHook is IHooks {
         });
     }
 
-    /// @notice Set or replace the allowlist. Only before the pool exists.
     /// @notice JIGLaunch calls this right after minting its position. From now until the window closes, no other
     ///         liquidity can be added: an outsider who LPs a thin band under the price would otherwise earn a large
     ///         share of their own 60% tax back as LP fees (swarm audit 2).
