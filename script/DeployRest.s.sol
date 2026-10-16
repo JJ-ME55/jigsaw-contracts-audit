@@ -13,7 +13,8 @@ import {CreatorFeeHook} from "../src/CreatorFeeHook.sol";
 /// Reads LAUNCH_PK, POT, optional PLATFORM (default deployer).
 contract DeployRest is Script {
     function run() external {
-        require(block.chainid != 1, "no mainnet");
+        // Ethereum and Robinhood Chain are mainnets: refuse unless ALLOW_MAINNET_DEPLOY=1 is set on purpose (rule 1: both founders, in writing)
+        if (block.chainid == 1 || block.chainid == 4663) require(vm.envOr("ALLOW_MAINNET_DEPLOY", false), "mainnet deploy refused: set ALLOW_MAINNET_DEPLOY=1 only after both founders said go in writing");
         uint256 pk = vm.envUint("LAUNCH_PK");
         address deployer = vm.addr(pk);
         address pot = vm.envAddress("POT");

@@ -15,7 +15,8 @@ import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 /// JIG_POOL_HOOK is the JIGLaunchHook address (the pool is dynamic-fee, tick spacing 200). Reads LAUNCH_PK (must be the hook owner).
 contract DeployDeepening is Script {
     function run() external {
-        require(block.chainid != 1, "no mainnet");
+        // Ethereum and Robinhood Chain are mainnets: refuse unless ALLOW_MAINNET_DEPLOY=1 is set on purpose (rule 1: both founders, in writing)
+        if (block.chainid == 1 || block.chainid == 4663) require(vm.envOr("ALLOW_MAINNET_DEPLOY", false), "mainnet deploy refused: set ALLOW_MAINNET_DEPLOY=1 only after both founders said go in writing");
         (address posm, address permit2) = _v4(block.chainid);
         uint256 pk = vm.envUint("LAUNCH_PK");
         address hook = vm.envAddress("HOOK");
@@ -42,6 +43,10 @@ contract DeployDeepening is Script {
 
     function _v4(uint256 chainId) internal pure returns (address posm, address permit2) {
         if (chainId == 11155111) return (0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4, 0x000000000022D473030F116dDEE9F6B43aC78BA3);
+        if (chainId == 4663) {
+            // Robinhood Chain, from developers.uniswap.org v4 deployments, checked on chain 16 Oct 2026 (all point at this PoolManager)
+            return (0x58daec3116aae6D93017bAAea7749052E8a04fA7, 0x000000000022D473030F116dDEE9F6B43aC78BA3);
+        }
         revert("v4 addresses not set for this chain");
     }
 }

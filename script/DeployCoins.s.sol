@@ -19,7 +19,8 @@ contract DeployCoins is Script {
     uint160 constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG);
 
     function run() external {
-        require(block.chainid != 1, "no mainnet");
+        // Ethereum and Robinhood Chain are mainnets: refuse unless ALLOW_MAINNET_DEPLOY=1 is set on purpose (rule 1: both founders, in writing)
+        if (block.chainid == 1 || block.chainid == 4663) require(vm.envOr("ALLOW_MAINNET_DEPLOY", false), "mainnet deploy refused: set ALLOW_MAINNET_DEPLOY=1 only after both founders said go in writing");
         (address posm, address permit2, address poolManager) = _v4(block.chainid);
 
         uint256 pk = vm.envUint("LAUNCH_PK");
@@ -68,6 +69,10 @@ contract DeployCoins is Script {
                 0x000000000022D473030F116dDEE9F6B43aC78BA3,
                 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543
             );
+        }
+        if (chainId == 4663) {
+            // Robinhood Chain, from developers.uniswap.org v4 deployments, checked on chain 16 Oct 2026 (all point at this PoolManager)
+            return (0x58daec3116aae6D93017bAAea7749052E8a04fA7, 0x000000000022D473030F116dDEE9F6B43aC78BA3, 0x8366a39CC670B4001A1121B8F6A443A643e40951);
         }
         revert("v4 addresses not set for this chain");
     }
