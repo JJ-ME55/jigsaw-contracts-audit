@@ -36,6 +36,18 @@ contract MockNFT is ERC721 {
 }
 
 /// A one-listing marketplace: pays the seller, hands the NFT to the buyer.
+/// A market whose fulfil pushes the module's pending hook slice into it mid-call (anyone can call claimFor).
+contract PushingMarket {
+    IERC721 public nft; address public seller; uint256 public tokenId; uint256 public price; CreatorFeeHook public hook;
+    constructor(IERC721 nft_, address seller_, uint256 tokenId_, uint256 price_, CreatorFeeHook hook_) { nft = nft_; seller = seller_; tokenId = tokenId_; price = price_; hook = hook_; }
+    function buy() external payable {
+        require(msg.value == price, "price");
+        hook.claimFor(msg.sender);
+        nft.transferFrom(seller, msg.sender, tokenId);
+        (bool ok,) = seller.call{value: msg.value}(""); require(ok);
+    }
+}
+
 contract MockMarket {
     IERC721 public nft; address public seller; uint256 public tokenId; uint256 public price;
     constructor(IERC721 nft_, address seller_, uint256 tokenId_, uint256 price_) { nft = nft_; seller = seller_; tokenId = tokenId_; price = price_; }
@@ -213,6 +225,25 @@ contract FlywheelsForkTest is Test {
         sab.setMarket(address(jig), true);
     }
 
+    // LOW (swarm audit 2): a JIG inflow during the marketplace call must not veto the sweep
+    function test_sweep_survives_a_jig_inflow_during_the_market_call() public {
+        SweepAndBurn sab = new SweepAndBurn(address(hook), address(nft), creator, platform, jigKey, 1e12);
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(address(sab));
+        _buyCoin(key, coinIs0, 500_000e18);
+        sab.pull();
+        uint256 budget = jig.balanceOf(address(sab));
+        _buyCoin(key, coinIs0, 100_000e18); // leaves a fresh claimable slice in the hook for the market to push
+        assertGt(hook.claimable(address(sab)), 0);
+        PushingMarket market = new PushingMarket(IERC721(address(nft)), seller, 5, 1e10, hook);
+        vm.prank(seller);
+        nft.setApprovalForAll(address(market), true);
+        vm.prank(creator);
+        sab.setMarket(address(market), true);
+        vm.prank(platform);
+        sab.sweep(address(market), abi.encodeCall(PushingMarket.buy, ()), 5, 1e10, budget, 1e10);
+        assertEq(nft.ownerOf(5), sab.DEAD(), "burned despite the inflow");
+    }
+
     // ---------- BuybackAndBurn ----------
 
     function test_buyback_and_burn() public {
@@ -272,6 +303,31 @@ contract FlywheelsForkTest is Test {
         assertEq(deep.tokenId(), id, "same position");
         assertGt(IPositionManager(POSM).getPositionLiquidity(id), liq1, "liquidity grew");
         deep.collectFees(); // no revert, fees (if any) go to the pot
+    }
+
+    // MEDIUM (swarm audit 2): fees accrued between runs must be paid to team/pot, not compounded into the locked position
+    function test_lp_deepening_pays_accrued_fees_before_adding() public {
+        LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey, platform);
+        vm.prank(buyer);
+        jig.transfer(address(deep), 1_000_000e18);
+        vm.prank(platform);
+        deep.run(1);
+        // trade on the JIG pool so the deepening position accrues ETH fees
+        address trader = makeAddr("trader");
+        vm.deal(trader, 50 ether);
+        for (uint256 i; i < 5; i++) {
+            vm.prank(trader);
+            swapper.swap{value: 5 ether}(jigKey, SwapParams({zeroForOne: true, amountSpecified: -int256(5 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        }
+        uint256 before = address(pot).balance + platform.balance;
+        uint128 liq1 = IPositionManager(POSM).getPositionLiquidity(deep.tokenId());
+        vm.prank(buyer);
+        jig.transfer(address(deep), 500_000e18);
+        vm.prank(platform);
+        deep.run(1); // must not revert and must pay the fees out first
+        assertGt(address(pot).balance + platform.balance, before, "accrued LP fees reached team and pot");
+        assertGt(IPositionManager(POSM).getPositionLiquidity(deep.tokenId()), liq1, "and the run still deepened");
+        assertEq(deep.platformOwedEth(), 0);
     }
 
 

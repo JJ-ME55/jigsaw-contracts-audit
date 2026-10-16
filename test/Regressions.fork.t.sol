@@ -356,19 +356,44 @@ contract RegressionsForkTest is Test {
         coin.approve(address(lp), type(uint256).max);
         lp.modifyLiquidity(key, ModifyLiquidityParams({tickLower: lo, tickUpper: hi, liquidityDelta: 1e15, salt: 0}), "");
         vm.stopPrank();
-        // attacker sells coin for an exact JIG output larger than the range holds, limit at the extreme
-        uint256 claimBefore = hook.totalClaimable();
-        uint256 coinBal = coin.balanceOf(buyer);
+        // the exact-output sell the attack used is refused outright now (swarm audit 2: it also underpaid the fee)
         vm.prank(buyer);
         coin.approve(address(swapper), type(uint256).max);
-        _swap(buyer, key, coinIs0, int256(70_000e18), ""); // exact-output sell that drains most of the range: the fee is coin and must be converted
+        _expectExactOutputSellRefused(buyer, key, coinIs0, 70_000e18);
+        // a large exact-input buy still converts its coin fee inside the range: credited or parked, never sold to the dust order
+        uint256 claimBefore = hook.totalClaimable();
+        _swap(buyer, key, !coinIs0, -600_000e18, "");
         uint256 pending = hook.pendingCoin(key.toId());
         assertTrue(hook.totalClaimable() > claimBefore || pending > 0, "the fee is credited or kept as pending coin, never sold for nothing");
-        assertLt(coin.balanceOf(buyer), coinBal, "attacker paid coin for the JIG and the fee");
         // the price never left the range, so the dust position below it saw no coin at all
         (uint160 spot,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
         uint160 edge = coinIs0 ? TickMath.getSqrtPriceAtTick(-887_200 + 0) : TickMath.getSqrtPriceAtTick(887_200);
         edge; spot;
+    }
+
+    // MEDIUM (swarm audit 2): exact-output sells valued the coin fee at the post-trade price (~55% of the exact-input fee)
+    function test_exact_output_sell_is_refused_exact_input_sell_pays_full_fee() public {
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -500_000e18, "");
+        vm.prank(buyer);
+        coin.approve(address(swapper), type(uint256).max);
+        _expectExactOutputSellRefused(buyer, key, coinIs0, 1_000e18); // exact JIG out, coin in
+        uint256 before = hook.totalClaimable();
+        uint256 jigBefore = jig.balanceOf(buyer);
+        _swap(buyer, key, coinIs0, -int256(coin.balanceOf(buyer) / 2), ""); // exact-input sell: fee is JIG, no conversion
+        uint256 out = jig.balanceOf(buyer) - jigBefore;
+        uint256 feeTaken = hook.totalClaimable() - before;
+        assertApproxEqRel(feeTaken, (out + feeTaken) / 100, 0.01e18, "1% of the gross JIG output");
+        // exact-output BUYS are still fine (fee in JIG, charged on top)
+        _swap(buyer, key, !coinIs0, int256(1_000e18), "");
+    }
+
+    /// expectRevert must sit directly before the swap call (the _swap helper's approve would absorb it)
+    function _expectExactOutputSellRefused(address who, PoolKey memory key, bool coinIs0, uint256 jigOut) internal {
+        vm.prank(who);
+        vm.expectRevert();
+        swapper.swap(key, SwapParams({zeroForOne: coinIs0, amountSpecified: int256(jigOut), sqrtPriceLimitX96: coinIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

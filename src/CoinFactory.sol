@@ -78,6 +78,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     event CoinLaunched(uint256 indexed index, address indexed coin, address indexed collection, address creator, uint24 feePips, address flywheel, uint256 tokenId, uint256 creatorTokens, uint256 devBuyJig, uint256 devBuyCoin);
     event LaunchFeeSet(uint256 launchFeeWei);
 
+    error BadAirdropRecipient();
     error ZeroAddress();
     error WrongFee();
     error CollectionHasCoin();
@@ -98,6 +99,11 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         hook = CreatorFeeHook(hook_);
         jig = IERC20(jig_);
         platform = platform_;
+        // a contract recipient must answer AirdropClaim.pot(): the strict notify() in launch() would otherwise revert every launch
+        if (airdropRecipient_.code.length > 0) {
+            (bool ok, bytes memory ret) = airdropRecipient_.staticcall(abi.encodeWithSignature("pot()"));
+            if (!ok || ret.length != 32) revert BadAirdropRecipient();
+        }
         airdropRecipient = airdropRecipient_;
         launchFeeWei = launchFeeWei_;
     }

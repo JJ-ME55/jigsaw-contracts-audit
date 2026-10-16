@@ -123,7 +123,7 @@ contract SweepAndBurn is IUnlockCallback, ReentrancyGuard {
 
         (bool ok,) = marketplace.call{value: priceWei}(data);
         if (!ok) revert MarketplaceCallFailed();
-        if (jig.balanceOf(address(this)) != jigAfterSwap) revert JigMoved();
+        if (jig.balanceOf(address(this)) < jigAfterSwap) revert JigMoved(); // an inflow (someone pushing our claim) is harmless
         if (!_heldHere(tokenId)) revert NotReceived();
 
         collection.transferFrom(address(this), DEAD, tokenId);

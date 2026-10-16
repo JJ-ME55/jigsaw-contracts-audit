@@ -14,10 +14,15 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
 
 /// Runs against a Sepolia fork: forge test --match-contract Fork --fork-url sepolia
 contract JIGLaunchHookForkTest is Test {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
     address constant POSM = 0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4;
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
@@ -52,7 +57,7 @@ contract JIGLaunchHookForkTest is Test {
         launch.setJig(address(jig));
 
         // Put the hook at an address with exactly the right flag bits.
-        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCD) << 20));
+        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCD) << 20));
         deployCodeTo("JIGLaunchHook.sol:JIGLaunchHook", abi.encode(POOL_MANAGER, address(jig), launcher, address(launch), SQRT_PRICE, TICK_SPACING), hookAddr);
         hook = JIGLaunchHook(hookAddr);
 
@@ -125,6 +130,25 @@ contract JIGLaunchHookForkTest is Test {
         assertApproxEqRel(address(pot).balance + platform.balance - before, 0.6 ether, 0.01e18, "60% of 1 ETH collected, split team/pot");
     }
 
+    // MEDIUM (swarm audit 2): a sniper who LPs a thin JIG band under the price earned ~40% of their own 60% tax back
+    function test_nobody_else_can_add_liquidity_during_the_window() public {
+        assertTrue(hook.seeded());
+        uint256 got = _buy(sniper, 1 ether, "");
+        assertGt(got, 0);
+        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(IPoolManager(POOL_MANAGER));
+        vm.startPrank(sniper);
+        jig.approve(address(lp), type(uint256).max);
+        (, int24 tick,,) = IPoolManager(POOL_MANAGER).getSlot0(_key().toId());
+        int24 lo = (tick / TICK_SPACING) * TICK_SPACING - 5 * TICK_SPACING;
+        ModifyLiquidityParams memory p = ModifyLiquidityParams({tickLower: lo, tickUpper: lo + 5 * TICK_SPACING, liquidityDelta: 1e18, salt: 0});
+        vm.expectRevert();
+        lp.modifyLiquidity(_key(), p, "");
+        // after the window anyone may LP
+        vm.warp(block.timestamp + 5 minutes);
+        lp.modifyLiquidity(_key(), p, "");
+        vm.stopPrank();
+    }
+
     function test_allowlist_locked_after_init() public {
         vm.prank(launcher);
         vm.expectRevert(JIGLaunchHook.AlreadyInitialized.selector);
@@ -133,7 +157,7 @@ contract JIGLaunchHookForkTest is Test {
 
     function test_nobody_else_can_initialise_or_front_run() public {
         // a fresh hook bound to this launch: a stranger cannot open the pool first
-        address h2 = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCE) << 20));
+        address h2 = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG) | (uint160(0xABCE) << 20));
         deployCodeTo("JIGLaunchHook.sol:JIGLaunchHook", abi.encode(POOL_MANAGER, address(jig), launcher, address(launch), SQRT_PRICE, TICK_SPACING), h2);
         PoolKey memory k = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: LPFeeLibrary.DYNAMIC_FEE_FLAG, tickSpacing: TICK_SPACING, hooks: IHooks(h2)});
         vm.prank(sniper);

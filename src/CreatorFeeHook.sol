@@ -115,6 +115,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error NotStale();
     error BadFlywheel();
     error HookNotImplemented();
+    error ExactOutputSell();
 
     constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
         poolManager = IPoolManager(poolManager_);
@@ -345,6 +346,10 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
 
         uint256 jigAmount = fee;
         bool feeIsCoin = Currency.unwrap(feeCurrency) == c.coin;
+        // An exact-output sell (exact JIG out, coin in) would take its fee in coin and sell it at the price the
+        // seller's own trade just left, about half the exact-input fee on a large unwind (swarm audit 2). Refuse it;
+        // routers fall back to exact-input, which pays f of the JIG output directly.
+        if (feeIsCoin && params.amountSpecified > 0) revert ExactOutputSell();
         if (feeIsCoin) jigAmount = _sellCoinForJig(key, c, fee);
 
         hookData;

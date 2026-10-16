@@ -19,7 +19,8 @@ interface IERC721Supply is IERC721 {
 ///         Paid in JIG, which is what the fee hook holds. Each pull is a checkpoint:
 ///         {supply at the pull, accumulator before it}. A token only earns from pulls
 ///         made while it existed. The collection must mint sequential ids from 1 and
-///         never decrease totalSupply (LoomCollection does both). Tokens sent to the dead
+///         never decrease totalSupply (LoomCollection does both: firstTokenId = totalSupply + 1, totalSupply is a
+///         monotone counter; see reference/LoomCollection.sol). A 0-based collection would over-claim here. Tokens sent to the dead
 ///         address can be marked burned so later pulls split among live tokens only; their
 ///         past accrual sweeps to the pot.
 ///

@@ -1,0 +1,1 @@
+Reference only, not compiled here: the swarm-written LoomCollection (OpenZeppelin upgradeable imports) as deployed by the NFT factory. HolderDrip and SweepAndBurn rely on its 1-based sequential ids, monotone totalSupply, and ordinary transferFrom to the dead address.

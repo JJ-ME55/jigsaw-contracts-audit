@@ -27,7 +27,7 @@ contract DeployCoins is Script {
         address jig = vm.envAddress("JIG");
         address pot = vm.envAddress("POT");
         address platform = vm.envOr("PLATFORM", deployer);
-        address airdrop = vm.envOr("AIRDROP", pot);
+        address airdrop = vm.envAddress("AIRDROP"); // required: a wrong recipient would brick every launch (swarm audit 2)
         uint256 launchFee = vm.envOr("LAUNCH_FEE_WEI", uint256(0.01 ether));
 
         vm.startBroadcast(pk);

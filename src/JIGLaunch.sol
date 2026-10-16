@@ -15,6 +15,10 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 
+interface IJIGLaunchHook {
+    function markSeeded() external;
+}
+
 /// @title JIGLaunch
 /// @notice One-shot fair launch of the JIG/ETH Uniswap v4 pool (spec 2).
 ///         Holds 90% of JIG supply from birth. `launch` creates the pool, seeds it
@@ -125,6 +129,7 @@ contract JIGLaunch {
         id = posm.nextTokenId();
         posm.modifyLiquidities(abi.encode(actions, params), block.timestamp);
         tokenId = id;
+        if (hooks != address(0)) IJIGLaunchHook(hooks).markSeeded(); // no other liquidity until the window closes
 
         emit Launched(id, sqrtPriceX96, tickLower, tickUpper, liquidity, amount - jig.balanceOf(address(this)));
     }

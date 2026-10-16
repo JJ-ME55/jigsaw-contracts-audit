@@ -46,6 +46,7 @@ contract JIGLaunchHook is IHooks {
     bytes32 public allowlistRoot;
     uint64 public windowEnd; // 0 until the pool is initialised
     bool public initialized;
+    bool public seeded; // set by JIGLaunch once its position is minted; from then until windowEnd no other liquidity may be added
 
     event AllowlistSet(bytes32 root);
     event WindowOpened(uint64 windowEnd);
@@ -56,6 +57,7 @@ contract JIGLaunchHook is IHooks {
     error WrongPool();
     error NotLaunch();
     error HookNotImplemented();
+    error WindowLocked();
 
     constructor(address poolManager_, address jig_, address owner_, address launch_, uint160 expectedSqrtPriceX96_, int24 expectedTickSpacing_) {
         poolManager = IPoolManager(poolManager_);
@@ -71,7 +73,7 @@ contract JIGLaunchHook is IHooks {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -87,6 +89,14 @@ contract JIGLaunchHook is IHooks {
     }
 
     /// @notice Set or replace the allowlist. Only before the pool exists.
+    /// @notice JIGLaunch calls this right after minting its position. From now until the window closes, no other
+    ///         liquidity can be added: an outsider who LPs a thin band under the price would otherwise earn a large
+    ///         share of their own 60% tax back as LP fees (swarm audit 2).
+    function markSeeded() external {
+        if (msg.sender != launch) revert NotLaunch();
+        seeded = true;
+    }
+
     function setAllowlist(bytes32 root) external {
         if (msg.sender != owner) revert NotOwner();
         if (initialized) revert AlreadyInitialized();
@@ -150,11 +160,13 @@ contract JIGLaunchHook is IHooks {
 
     function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
-        pure
+        view
         override
         returns (bytes4)
     {
-        revert HookNotImplemented();
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        if (seeded && block.timestamp < windowEnd) revert WindowLocked();
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(

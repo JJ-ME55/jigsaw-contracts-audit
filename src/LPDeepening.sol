@@ -87,6 +87,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     /// @param minEthOut the least ETH the keeper will accept for the half it sells (off-chain quote minus tolerance)
     function run(uint256 minEthOut) external nonReentrant {
         if (msg.sender != keeper) revert NotKeeper();
+        if (tokenId != 0) _collectFees(); // pay out accrued LP fees first; INCREASE_LIQUIDITY would otherwise lock them (swarm audit 2)
         hook.claim();
         uint256 amount = jig.balanceOf(address(this));
         if (amount == 0) revert Nothing();
@@ -96,10 +97,11 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         uint256 ethGot = address(this).balance - ethBefore;
         if (ethGot < minEthOut || ethGot == 0) revert TooLittleOut();
         uint256 jigLeft = amount - half; // only this run's other half goes in; the rest waits
+        uint256 eth = address(this).balance - platformOwedEth; // ETH booked for the team is not working capital
 
         (uint160 sqrtP,,,) = poolManager.getSlot0(jigPool.toId());
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), address(this).balance, jigLeft
+            sqrtP, TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), eth, jigLeft
         );
         if (liquidity == 0) revert Nothing();
 
@@ -110,17 +112,17 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         bytes[] memory params = new bytes[](3);
         if (tokenId == 0) {
             actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP));
-            params[0] = abi.encode(jigPool, tickLower, tickUpper, liquidity, uint128(address(this).balance), uint128(jigLeft), address(this), bytes(""));
+            params[0] = abi.encode(jigPool, tickLower, tickUpper, liquidity, uint128(eth), uint128(jigLeft), address(this), bytes(""));
             tokenId = posm.nextTokenId();
         } else {
             actions = abi.encodePacked(uint8(Actions.INCREASE_LIQUIDITY), uint8(Actions.SETTLE_PAIR), uint8(Actions.SWEEP));
-            params[0] = abi.encode(tokenId, liquidity, uint128(address(this).balance), uint128(jigLeft), bytes(""));
+            params[0] = abi.encode(tokenId, liquidity, uint128(eth), uint128(jigLeft), bytes(""));
         }
         params[1] = abi.encode(jigPool.currency0, jigPool.currency1);
         params[2] = abi.encode(jigPool.currency0, address(this)); // refund unused ETH
         uint256 ethBeforeAdd = address(this).balance;
         uint256 jigBeforeAdd = jig.balanceOf(address(this));
-        posm.modifyLiquidities{value: address(this).balance}(abi.encode(actions, params), block.timestamp);
+        posm.modifyLiquidities{value: eth}(abi.encode(actions, params), block.timestamp);
         uint256 ethAdded = ethBeforeAdd - address(this).balance;
         uint256 jigAdded = jigBeforeAdd - jig.balanceOf(address(this));
         totalEthAdded += ethAdded;
@@ -133,6 +135,10 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     ///         Collected fees are kept separate from the module's working balance by paying out in the same call.
     function collectFees() external nonReentrant {
         if (tokenId == 0) revert Nothing();
+        _collectFees();
+    }
+
+    function _collectFees() internal {
         uint256 ethBefore = address(this).balance;
         uint256 jigBefore = jig.balanceOf(address(this));
         bytes memory actions = abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY), uint8(Actions.TAKE_PAIR));
