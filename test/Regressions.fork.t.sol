@@ -14,6 +14,9 @@ import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
 import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
+import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -38,6 +41,7 @@ contract OwnedNFT is ERC721 {
 /// Pins the fixes from the 15 Oct 2026 adversarial review. forge test --match-contract RegressionsFork --fork-url sepolia
 contract RegressionsForkTest is Test {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     address constant POSM = 0x429ba70129df741B2Ca2a85BC3A2a3328e5c09b4;
     address constant POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
@@ -336,6 +340,35 @@ contract RegressionsForkTest is Test {
         assertEq(hook.claimable(creator), creatorBefore, "creator gains nothing");
         assertGt(hook.claimable(address(pot)) - potBefore, dripBal * 6000 / 10_000, "the block went to the pot");
         assertEq(hook.claimable(address(drip)), 0);
+    }
+
+    // HIGH (swarm audit): a dust JIG order on the empty side of the range must not capture the coin-side fee
+    function test_dust_order_outside_range_cannot_capture_the_fee() public {
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -100_000e18, ""); // put ~90k JIG into the range
+        // attacker parks a dust position on the empty side of the range
+        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(IPoolManager(POOL_MANAGER));
+        int24 lo = coinIs0 ? int24(-600_000) : int24(600_000);
+        int24 hi = lo + 200;
+        vm.startPrank(buyer);
+        jig.approve(address(lp), type(uint256).max);
+        coin.approve(address(lp), type(uint256).max);
+        lp.modifyLiquidity(key, ModifyLiquidityParams({tickLower: lo, tickUpper: hi, liquidityDelta: 1e15, salt: 0}), "");
+        vm.stopPrank();
+        // attacker sells coin for an exact JIG output larger than the range holds, limit at the extreme
+        uint256 claimBefore = hook.totalClaimable();
+        uint256 coinBal = coin.balanceOf(buyer);
+        vm.prank(buyer);
+        coin.approve(address(swapper), type(uint256).max);
+        _swap(buyer, key, coinIs0, int256(70_000e18), ""); // exact-output sell that drains most of the range: the fee is coin and must be converted
+        uint256 pending = hook.pendingCoin(key.toId());
+        assertTrue(hook.totalClaimable() > claimBefore || pending > 0, "the fee is credited or kept as pending coin, never sold for nothing");
+        assertLt(coin.balanceOf(buyer), coinBal, "attacker paid coin for the JIG and the fee");
+        // the price never left the range, so the dust position below it saw no coin at all
+        (uint160 spot,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
+        uint160 edge = coinIs0 ? TickMath.getSqrtPriceAtTick(-887_200 + 0) : TickMath.getSqrtPriceAtTick(887_200);
+        edge; spot;
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

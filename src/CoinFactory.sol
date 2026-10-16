@@ -131,10 +131,11 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
         int24 startTick = TickMath.getTickAtSqrtPrice(p.sqrtPriceX96);
         if (p.tickLower >= p.tickUpper) revert RangeWrongSide();
-        if (coinIs0 ? p.tickLower <= startTick : p.tickUpper > startTick) revert RangeWrongSide();
+        // coin as currency0: the range must sit above the price; the boundary tick is allowed only at its exact price
+        if (coinIs0 ? (p.tickLower < startTick || (p.tickLower == startTick && p.sqrtPriceX96 != TickMath.getSqrtPriceAtTick(startTick))) : p.tickUpper > startTick) revert RangeWrongSide();
 
         _keyOf[p.collection] = key;
-        hook.register(key, msg.sender, p.flywheel, p.feePips, p.creatorShareBps);
+        hook.register(key, msg.sender, p.flywheel, p.feePips, p.creatorShareBps, p.tickLower, p.tickUpper);
         if (posm.initializePool(key, p.sqrtPriceX96) == type(int24).max) revert PoolInitFailed();
 
         uint256 creatorTokens = (SUPPLY * p.creatorBps) / 10_000;
@@ -172,11 +173,11 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     /// @dev Creator's dev buy: pull JIG from the creator, swap it for the coin on the fresh pool, send the coin to the creator.
     function _devBuy(PoolKey memory key, bool coinIs0, address coinAddr, uint256 jigIn, uint256 minOut) internal returns (uint256 got) {
         jig.safeTransferFrom(msg.sender, address(this), jigIn);
-        got = abi.decode(poolManager.unlock(abi.encode(key, coinIs0, jigIn)), (uint256));
+        (uint256 got_, uint256 spent) = abi.decode(poolManager.unlock(abi.encode(key, coinIs0, jigIn)), (uint256, uint256));
+        got = got_;
         if (got < minOut || got == 0) revert TooLittleOut();
         IERC20(coinAddr).safeTransfer(msg.sender, got);
-        uint256 left = jig.balanceOf(address(this));
-        if (left > 0) jig.safeTransfer(msg.sender, left); // a partial fill refunds the unspent JIG
+        if (jigIn > spent) jig.safeTransfer(msg.sender, jigIn - spent); // a partial fill refunds only this buy's unspent JIG
     }
 
     function unlockCallback(bytes calldata data) external override returns (bytes memory) {
@@ -200,7 +201,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         }
         uint256 got = uint256(uint128(coinDelta));
         if (got > 0) poolManager.take(coinC, address(this), got);
-        return abi.encode(got);
+        return abi.encode(got, spent);
     }
 
     /// @dev The caller must be the collection's creator(). Only a collection with no creator() falls back to owner():

@@ -50,11 +50,6 @@ contract PotVault is Ownable2Step, ReentrancyGuard {
         emit Received(msg.sender, address(0), msg.value);
     }
 
-    /// @notice Record an ERC-20 deposit. Tokens sent by plain transfer still count; this just emits.
-    function notifyDeposit(address token, uint256 amount) external {
-        emit Received(msg.sender, token, amount);
-    }
-
     /// @notice One-way switch. Flip only after legal advice; both founders behind the owner key.
     function enablePayouts() external onlyOwner {
         payoutsEnabled = true;

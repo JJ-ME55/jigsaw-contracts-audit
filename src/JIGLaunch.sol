@@ -40,6 +40,7 @@ contract JIGLaunch {
     address public immutable potVault;
     address public immutable platform;
     uint16 public constant TEAM_BPS = 5000; // half of collected fees to the team, half to the pot (Jj, 15 Oct)
+    uint256 public platformOwedEth; // team ETH whose push failed; withdrawn by the platform
 
     IERC20 public jig;
     PoolKey public poolKey;
@@ -56,6 +57,7 @@ contract JIGLaunch {
     error RangeNotBelowPrice();
     error ZeroAddress();
     error PayoutFailed();
+    error NotPlatform();
     error PriceMismatch();
 
     constructor(address posm_, address permit2_, address launcher_, address potVault_, address platform_) {
@@ -141,12 +143,13 @@ contract JIGLaunch {
 
     /// @dev Split whatever this contract holds of ETH and JIG: TEAM_BPS to platform, the rest to the pot.
     function _payout() internal {
-        uint256 eth = address(this).balance;
+        uint256 eth = address(this).balance - platformOwedEth;
         if (eth > 0) {
             uint256 team = (eth * TEAM_BPS) / 10_000;
-            (bool a,) = platform.call{value: team}("");
             (bool b,) = potVault.call{value: eth - team}("");
-            if (!a || !b) revert PayoutFailed();
+            if (!b) revert PayoutFailed();
+            (bool a,) = platform.call{value: team}("");
+            if (!a) platformOwedEth += team; // never block the pot on the platform's receive
         }
         uint256 j = jig.balanceOf(address(this));
         if (j > 0) {
@@ -156,6 +159,15 @@ contract JIGLaunch {
         }
     }
 
+
+    /// @notice Withdraw team ETH that could not be pushed. Platform only.
+    function withdrawPlatform() external {
+        if (msg.sender != platform) revert NotPlatform();
+        uint256 amt = platformOwedEth;
+        platformOwedEth = 0;
+        (bool ok,) = platform.call{value: amt}("");
+        if (!ok) revert PayoutFailed();
+    }
 
     /// @dev PositionManager mints with plain _mint, but accept safe transfers too.
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

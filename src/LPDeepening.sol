@@ -24,7 +24,7 @@ import {CreatorFeeHook} from "./CreatorFeeHook.sol";
 ///         permanent JIG/ETH liquidity. `run()` pulls the module's JIG from the hook,
 ///         sells half for ETH on the JIG/ETH pool, and adds both as full-range liquidity
 ///         to a position this contract holds forever. There is no function to remove
-///         liquidity or transfer the position. LP fees it earns are collected to the pot.
+///         liquidity or transfer the position. LP fees it earns go half to the team wallet, half to the pot, like the JIG pool's.
 ///         Shared: one instance, bound to the hook as `deepening`. Keeper-only runs at times
 ///         the back end chooses; each run uses the whole balance with a keeper-supplied minimum out.
 contract LPDeepening is IUnlockCallback, ReentrancyGuard {
@@ -39,7 +39,8 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     IAllowanceTransfer public immutable permit2;
     address public immutable pot;
     address public immutable platform;
-    uint16 public constant TEAM_BPS = 5000;
+    uint16 public constant TEAM_BPS = 5000; // the deepening position's fees are JIG-pool fees: same 50/50 team/pot as JIGLaunch (Jj, 15 Oct)
+    uint256 public platformOwedEth; // team ETH whose push failed; withdrawn by the platform
     PoolKey public jigPool; // ETH / JIG
 
     address public immutable keeper;
@@ -57,6 +58,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     error ZeroAddress();
     error Nothing();
     error PayoutFailed();
+    error NotPlatformAddr();
     error NotKeeper();
     error TooLittleOut();
 
@@ -142,9 +144,10 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         uint256 j = jig.balanceOf(address(this)) - jigBefore;
         if (eth > 0) {
             uint256 team = (eth * TEAM_BPS) / 10_000;
-            (bool a,) = platform.call{value: team}("");
             (bool b,) = pot.call{value: eth - team}("");
-            if (!a || !b) revert PayoutFailed();
+            if (!b) revert PayoutFailed();
+            (bool a,) = platform.call{value: team}("");
+            if (!a) platformOwedEth += team;
         }
         if (j > 0) {
             uint256 team = (j * TEAM_BPS) / 10_000;
@@ -152,6 +155,15 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
             jig.safeTransfer(pot, j - team);
         }
         emit FeesCollected(eth, j);
+    }
+
+    /// @notice Withdraw team ETH that could not be pushed. Platform only.
+    function withdrawPlatform() external {
+        if (msg.sender != platform) revert NotPlatformAddr();
+        uint256 amt = platformOwedEth;
+        platformOwedEth = 0;
+        (bool ok,) = platform.call{value: amt}("");
+        if (!ok) revert PayoutFailed();
     }
 
     /// @dev Sell `amount` JIG for ETH on the JIG/ETH pool (JIG is currency1).

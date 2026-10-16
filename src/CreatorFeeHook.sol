@@ -6,6 +6,7 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -43,6 +44,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
+    using StateLibrary for IPoolManager;
     using CurrencyLibrary for Currency;
 
     struct Config {
@@ -52,6 +54,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         uint24 feePips; // 10_000 (1%) .. 100_000 (10%)
         uint16 creatorBps; // creator's share of the fee; flywheel gets block - creatorBps
         PoolId id;
+        int24 tickLower; // the seeded range: the nested conversion never sells outside it
+        int24 tickUpper;
         uint64 launchedAt;
         bool coinIs0;
         bool registered;
@@ -160,7 +164,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Called by the factory before it initialises the pool.
-    function register(PoolKey calldata key, address creator, address flywheel, uint24 feePips, uint16 creatorBps) external {
+    function register(PoolKey calldata key, address creator, address flywheel, uint24 feePips, uint16 creatorBps, int24 tickLower, int24 tickUpper) external {
         if (msg.sender != factory) revert NotFactory();
         if (
             flywheel == platform || flywheel == pot || flywheel == deepening || flywheel == address(this)
@@ -186,6 +190,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
             feePips: feePips,
             creatorBps: creatorBps,
             id: id,
+            tickLower: tickLower,
+            tickUpper: tickUpper,
             launchedAt: uint64(block.timestamp),
             coinIs0: coinIs0,
             registered: true
@@ -339,7 +345,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
 
         uint256 jigAmount = fee;
         bool feeIsCoin = Currency.unwrap(feeCurrency) == c.coin;
-        if (feeIsCoin) jigAmount = _sellCoinForJig(key, id, c.coinIs0, fee);
+        if (feeIsCoin) jigAmount = _sellCoinForJig(key, c, fee);
 
         hookData;
         _split(c, jigAmount);
@@ -347,18 +353,23 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         return (IHooks.afterSwap.selector, int128(uint128(fee)));
     }
 
-    /// @dev Sell `amount` of the coin into the same pool for JIG, inside the current unlock.
-    function _sellCoinForJig(PoolKey calldata key, PoolId id, bool coinIs0, uint256 amount) internal returns (uint256 jigOut) {
+    /// @dev Sell `amount` of the coin into the same pool for JIG, inside the current unlock. The sale never leaves the
+    ///      launch range: selling the coin pushes the price toward the empty side, and anything parked there (a dust JIG
+    ///      order below the range) would otherwise buy the whole fee for nothing. If the price already sits at the range
+    ///      edge, the fee waits as pendingCoin and is converted on a later swap that has moved the price back inside.
+    function _sellCoinForJig(PoolKey calldata key, Config storage c, uint256 amount) internal returns (uint256 jigOut) {
+        PoolId id = c.id;
+        bool coinIs0 = c.coinIs0;
         amount += pendingCoin[id]; // retry anything a previous partial fill left behind
+        uint160 limit = coinIs0 ? TickMath.getSqrtPriceAtTick(c.tickLower) : TickMath.getSqrtPriceAtTick(c.tickUpper);
+        (uint160 spot,,,) = poolManager.getSlot0(id);
+        if (coinIs0 ? spot <= limit : spot >= limit) {
+            pendingCoin[id] = amount; // nothing to sell into inside the range right now
+            return 0;
+        }
         _converting = true;
         BalanceDelta d = poolManager.swap(
-            key,
-            SwapParams({
-                zeroForOne: coinIs0,
-                amountSpecified: -int256(amount),
-                sqrtPriceLimitX96: coinIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            }),
-            ""
+            key, SwapParams({zeroForOne: coinIs0, amountSpecified: -int256(amount), sqrtPriceLimitX96: limit}), ""
         );
         _converting = false;
         Currency coin = coinIs0 ? key.currency0 : key.currency1;

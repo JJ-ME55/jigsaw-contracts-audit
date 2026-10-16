@@ -76,7 +76,7 @@ contract HolderDrip is ReentrancyGuard {
         hook.claim();
         amount = undistributed();
         uint256 supply = collection.totalSupply();
-        uint256 live = supply - burnedCount;
+        uint256 live = supply > burnedCount ? supply - burnedCount : 0;
         if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
         checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));
         accPerToken += (amount * ACC) / live;

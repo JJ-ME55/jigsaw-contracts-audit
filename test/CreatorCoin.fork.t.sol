@@ -147,7 +147,7 @@ contract CreatorCoinForkTest is Test {
     function test_buy_during_snipe_window_pays_60pct_then_decays() public {
         _launch(10_000);
         PoolId id = key.toId();
-        (,,,,,, uint64 launchedAt,,) = hook.pools(id);
+        (,,,,,,,, uint64 launchedAt,,) = hook.pools(id);
         assertEq(hook.currentFee(id), 600_000);
         vm.warp(launchedAt + 5 seconds);
         assertApproxEqAbs(hook.currentFee(id), 305_000, 1000);
