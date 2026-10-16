@@ -2,35 +2,41 @@
 pragma solidity 0.8.26;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import {ERC2981Upgradeable} from "@openzeppelin/contracts-upgradeable/token/common/ERC2981Upgradeable.sol";
 import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {IERC2981} from "@openzeppelin/contracts/interfaces/IERC2981.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
-/// @notice Immutable ERC-721 logic for EIP-1167 clones with collection-local ownership and accounting.
-/// @dev This contract has no upgrade entry point. Only clone storage may be initialized.
+/// @title LoomCollection
+/// @notice Fixed ERC-721 logic for EIP-1167 clones. Each clone has its own owner and configuration.
+/// @dev The implementation is locked. Factory creation initializes each clone atomically.
 contract LoomCollection is
     ERC721Upgradeable,
-    ERC2981Upgradeable,
     Ownable2StepUpgradeable,
     PausableUpgradeable,
-    ReentrancyGuardUpgradeable
+    ReentrancyGuardUpgradeable,
+    IERC2981
 {
     uint256 public constant PLATFORM_FEE = 0.0005 ether;
+    uint256 public constant CREATOR_FEE_SHARE = PLATFORM_FEE * 40 / 100;
+    uint256 public constant PLATFORM_FEE_SHARE = PLATFORM_FEE * 40 / 100;
+    uint256 public constant RESERVE_FEE_SHARE = PLATFORM_FEE - CREATOR_FEE_SHARE - PLATFORM_FEE_SHARE;
+    uint96 public constant MAX_ROYALTY_BPS = 1000;
+    uint256 public constant RESERVE_SUPPLY_DENOMINATOR = 100;
+
     address public immutable PLATFORM;
     address public immutable RESERVE;
 
-    uint256 public maxSupply;
-    uint256 public mintPrice;
-    uint256 public maxPerWallet;
     address public creator;
+    uint256 public maxSupply;
+    uint256 public mintPriceWei;
+    uint256 public maxPerWallet;
     uint96 public royaltyBps;
-
-    /// @notice Public and reserve mints share the same supply and sequential IDs starting at 1.
     uint256 public totalSupply;
     uint256 public reserveMinted;
-    /// @notice Lifetime public mints; transfers and reserve mints do not change this count.
     mapping(address wallet => uint256 quantity) public mintedPerWallet;
 
     string public baseURI;
@@ -41,41 +47,41 @@ contract LoomCollection is
     bool public revealSeedSet;
     bool public metadataFrozen;
 
-    error InvalidAddress();
-    error InvalidSupply();
-    error InvalidWalletCap();
+    error ZeroAddress();
+    error EmptyNameOrSymbol();
+    error InvalidSupplyOrWalletCap();
     error InvalidMintPrice();
-    error InvalidRoyalty();
+    error RoyaltyTooHigh();
     error ZeroQuantity();
-    error IncorrectPayment(uint256 expected, uint256 received);
-    error MaxSupplyExceeded();
+    error SupplyCapExceeded();
     error WalletCapExceeded();
     error ReserveCapExceeded();
-    error PaymentFailed(address recipient, uint256 amount);
+    error IncorrectPayment(uint256 expected, uint256 actual);
+    error ETHTransferFailed(address recipient);
     error MetadataIsFrozen();
     error ProvenanceAlreadySet();
     error MintingAlreadyStarted();
     error RevealSeedAlreadySet();
 
-    event Minted(address indexed minter, uint256 indexed firstTokenId, uint256 quantity, bool reserved);
-    event FeesDistributed(address indexed payer, uint256 creatorAmount, uint256 platformAmount, uint256 reserveAmount);
-    event ProvenanceSet(bytes32 indexed provenanceHash);
-    event Revealed(bytes32 indexed revealSeed);
+    event Minted(address indexed minter, uint256 indexed firstTokenId, uint256 quantity);
+    event ReserveMinted(address indexed owner, uint256 indexed firstTokenId, uint256 quantity);
+    /// @dev creatorAmount includes both the mint price and the creator's platform-fee share.
+    event FeesDistributed(uint256 creatorAmount, uint256 platformAmount, uint256 reserveAmount);
+    event ProvenanceSet(bytes32 provenanceHash);
+    event Revealed(bytes32 revealSeed);
     event MetadataFrozen();
     event BaseURISet(string baseURI);
     event UnrevealedURISet(string unrevealedURI);
 
-    /// @param platform Recipient of 40% of each per-token platform fee, shared by all clones.
-    /// @param reserve Recipient of 20% of each per-token platform fee, shared by all clones.
     constructor(address platform, address reserve) {
-        if (platform == address(0) || reserve == address(0)) revert InvalidAddress();
+        if (platform == address(0) || reserve == address(0)) revert ZeroAddress();
         PLATFORM = platform;
         RESERVE = reserve;
         _disableInitializers();
     }
 
-    /// @notice Called atomically by LoomFactory immediately after cloning.
-    /// @dev An independently deployed clone must also be initialized in its deployment transaction.
+    /// @notice Configure a fresh clone once. Mint price, caps, creator and royalties then stay fixed.
+    /// @dev Do not deploy a clone and initialize it in separate transactions: initialization is public.
     function initialize(
         string calldata name_,
         string calldata symbol_,
@@ -86,59 +92,46 @@ contract LoomCollection is
         uint96 royaltyBps_,
         address owner_
     ) external initializer {
-        if (creator_ == address(0) || owner_ == address(0)) revert InvalidAddress();
-        if (maxSupply_ == 0) revert InvalidSupply();
-        if (maxPerWallet_ == 0 || maxPerWallet_ > maxSupply_) revert InvalidWalletCap();
-        // Every permitted batch must have a representable exact price, including its platform fee.
+        if (creator_ == address(0) || owner_ == address(0)) revert ZeroAddress();
+        if (bytes(name_).length == 0 || bytes(symbol_).length == 0) revert EmptyNameOrSymbol();
+        if (maxSupply_ == 0 || maxPerWallet_ == 0 || maxPerWallet_ > maxSupply_) {
+            revert InvalidSupplyOrWalletCap();
+        }
         if (mintPriceWei_ > type(uint256).max - PLATFORM_FEE) revert InvalidMintPrice();
-        if (maxSupply_ > type(uint256).max / (mintPriceWei_ + PLATFORM_FEE)) revert InvalidMintPrice();
-        if (royaltyBps_ > 10_000) revert InvalidRoyalty();
+        if (royaltyBps_ > MAX_ROYALTY_BPS) revert RoyaltyTooHigh();
 
         __ERC721_init(name_, symbol_);
-        __ERC2981_init();
         __Ownable_init(owner_);
         __Ownable2Step_init();
         __Pausable_init();
         __ReentrancyGuard_init();
 
-        maxSupply = maxSupply_;
-        mintPrice = mintPriceWei_;
-        maxPerWallet = maxPerWallet_;
         creator = creator_;
+        maxSupply = maxSupply_;
+        mintPriceWei = mintPriceWei_;
+        maxPerWallet = maxPerWallet_;
         royaltyBps = royaltyBps_;
-        _setDefaultRoyalty(creator_, royaltyBps_);
     }
 
-    /// @notice Safely mint to the caller and immediately distribute the exact ETH payment.
+    /// @notice Mint to the caller, charging the exact price and enforcing a lifetime wallet allowance.
     function mint(uint256 quantity) external payable nonReentrant whenNotPaused {
-        _checkQuantity(quantity);
+        _checkMint(quantity);
         if (quantity > maxPerWallet - mintedPerWallet[msg.sender]) revert WalletCapExceeded();
-        uint256 expected = (mintPrice + PLATFORM_FEE) * quantity;
-        if (msg.value != expected) revert IncorrectPayment(expected, msg.value);
-
         mintedPerWallet[msg.sender] += quantity;
-        _mintBatch(msg.sender, quantity, false);
-
-        // The fixed fee is divisible by five: these per-token shares never produce rounding dust.
-        uint256 platformAmount = (PLATFORM_FEE / 5 * 2) * quantity;
-        uint256 reserveAmount = (PLATFORM_FEE / 5) * quantity;
-        uint256 creatorAmount = expected - platformAmount - reserveAmount;
-        _pay(creator, creatorAmount);
-        _pay(PLATFORM, platformAmount);
-        _pay(RESERVE, reserveAmount);
-        emit FeesDistributed(msg.sender, creatorAmount, platformAmount, reserveAmount);
+        _mintAndDistribute(msg.sender, quantity, false);
     }
 
-    /// @notice The owner may safely mint up to floor(maxSupply / 100) tokens to itself, without a fee.
-    /// @dev The allowance is collection-wide across ownership transfers; public mints can sell it out.
-    function reserveMint(uint256 quantity) external nonReentrant onlyOwner whenNotPaused {
-        _checkQuantity(quantity);
-        if (quantity > maxSupply / 100 - reserveMinted) revert ReserveCapExceeded();
+    /// @notice Owner allowance: at most floor(maxSupply / 100) tokens across all owners combined.
+    /// @dev Uses the same payment formula as mint(); does not consume the public wallet allowance.
+    ///      It shares the hard supply cap and does not set supply aside from public minting.
+    function reserveMint(uint256 quantity) external payable nonReentrant onlyOwner whenNotPaused {
+        _checkMint(quantity);
+        if (quantity > maxSupply / RESERVE_SUPPLY_DENOMINATOR - reserveMinted) revert ReserveCapExceeded();
         reserveMinted += quantity;
-        _mintBatch(msg.sender, quantity, true);
+        _mintAndDistribute(msg.sender, quantity, true);
     }
 
-    /// @notice Pause minting only. Existing tokens remain transferable.
+    /// @notice Pause new public and reserve mints. ERC-721 approvals and transfers remain available.
     function pause() external onlyOwner {
         _pause();
     }
@@ -147,7 +140,7 @@ contract LoomCollection is
         _unpause();
     }
 
-    /// @notice Record an off-chain art commitment once, before any public or reserve mint.
+    /// @notice Commit the off-chain metadata provenance before the first public or reserve mint.
     function setProvenanceHash(bytes32 hash) external onlyOwner {
         _requireMutableMetadata();
         if (provenanceSet) revert ProvenanceAlreadySet();
@@ -157,7 +150,8 @@ contract LoomCollection is
         emit ProvenanceSet(hash);
     }
 
-    /// @notice Record one owner-supplied seed. It does not generate randomness or reorder token IDs.
+    /// @notice Record the owner's off-chain reveal seed once, including if that seed is zero.
+    /// @dev This is an auditable record, not a source of random numbers or an on-chain shuffle.
     function setRevealSeed(bytes32 seed) external onlyOwner {
         _requireMutableMetadata();
         if (revealSeedSet) revert RevealSeedAlreadySet();
@@ -178,7 +172,8 @@ contract LoomCollection is
         emit UnrevealedURISet(uri);
     }
 
-    /// @notice Irreversibly lock both URIs, provenance and seed, including any still-unset values.
+    /// @notice Irreversibly lock URIs, provenance and reveal seed in their current state.
+    /// @dev An owner may intentionally freeze an empty URI or unset provenance/seed.
     function freezeMetadata() external onlyOwner {
         _requireMutableMetadata();
         metadataFrozen = true;
@@ -191,33 +186,45 @@ contract LoomCollection is
         return string.concat(baseURI, Strings.toString(tokenId), ".json");
     }
 
-    function supportsInterface(bytes4 interfaceId)
-        public
-        view
-        override(ERC721Upgradeable, ERC2981Upgradeable)
-        returns (bool)
-    {
-        return super.supportsInterface(interfaceId);
+    /// @notice ERC-2981 quote; marketplaces choose whether to pay it. Receiver and rate are fixed.
+    function royaltyInfo(uint256, uint256 salePrice) external view returns (address receiver, uint256 royaltyAmount) {
+        return (creator, Math.mulDiv(salePrice, royaltyBps, 10_000));
     }
 
-    function _checkQuantity(uint256 quantity) private view {
+    function supportsInterface(bytes4 interfaceId) public view override(ERC721Upgradeable, IERC165) returns (bool) {
+        return interfaceId == type(IERC2981).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    function _checkMint(uint256 quantity) private view {
         if (quantity == 0) revert ZeroQuantity();
-        if (quantity > maxSupply - totalSupply) revert MaxSupplyExceeded();
+        if (quantity > maxSupply - totalSupply) revert SupplyCapExceeded();
+        uint256 expected = (mintPriceWei + PLATFORM_FEE) * quantity;
+        if (msg.value != expected) revert IncorrectPayment(expected, msg.value);
     }
 
-    function _mintBatch(address recipient, uint256 quantity, bool reserved) private {
+    function _mintAndDistribute(address recipient, uint256 quantity, bool isReserve) private {
         uint256 firstTokenId = totalSupply + 1;
-        // Reserve the entire batch before any ERC-721 receiver callback.
+        // Reserve the entire batch before the first ERC-721 receiver callback.
         totalSupply += quantity;
+        emit Minted(recipient, firstTokenId, quantity);
+        if (isReserve) emit ReserveMinted(recipient, firstTokenId, quantity);
         for (uint256 i; i < quantity; ++i) {
             _safeMint(recipient, firstTokenId + i);
         }
-        emit Minted(recipient, firstTokenId, quantity, reserved);
+
+        // Constant per-token shares divide exactly, so batching cannot change rounding or fees.
+        uint256 creatorAmount = (mintPriceWei + CREATOR_FEE_SHARE) * quantity;
+        uint256 platformAmount = PLATFORM_FEE_SHARE * quantity;
+        uint256 reserveAmount = RESERVE_FEE_SHARE * quantity;
+        emit FeesDistributed(creatorAmount, platformAmount, reserveAmount);
+        _sendETH(creator, creatorAmount);
+        _sendETH(PLATFORM, platformAmount);
+        _sendETH(RESERVE, reserveAmount);
     }
 
-    function _pay(address recipient, uint256 amount) private {
-        (bool success,) = recipient.call{value: amount}("");
-        if (!success) revert PaymentFailed(recipient, amount);
+    function _sendETH(address recipient, uint256 amount) private {
+        (bool success,) = payable(recipient).call{value: amount}("");
+        if (!success) revert ETHTransferFailed(recipient);
     }
 
     function _requireMutableMetadata() private view {
