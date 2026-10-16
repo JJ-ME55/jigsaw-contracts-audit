@@ -66,6 +66,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         uint16 creatorBps; // share of supply to the creator's wallet at launch, 0..500 (0..5%)
         uint256 devBuyJig; // JIG the creator spends buying the coin in this transaction, 0 for none (needs approval)
         uint256 devBuyMinCoin; // slippage floor for the dev buy
+        uint256 maxFeeWei; // the most the creator agrees to pay as launch fee (the quote plus their tolerance)
         uint160 sqrtPriceX96; // start price as sqrt(currency1 per currency0) * 2^96, for the pair's ordering
         int24 tickLower; // seeded range, single-sided on the coin
         int24 tickUpper;
@@ -119,7 +120,8 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     }
 
     function launch(LaunchParams calldata p) external payable nonReentrant returns (uint256 index, address coinAddr) {
-        if (msg.value < launchFeeWei) revert WrongFee(); // a fee update landing before a quoted launch must not revert it; excess is refunded
+        uint256 fee = launchFeeWei; // read once: paid and refunded against the same number
+        if (msg.value < fee || fee > p.maxFeeWei) revert WrongFee(); // a fee update before a quoted launch is fine up to the creator's stated maximum; excess is refunded
         if (p.collection == address(0) || p.collection.code.length == 0) revert ZeroAddress();
         if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
         if (coinOf[p.collection] != address(0)) revert CollectionHasCoin();
@@ -161,10 +163,10 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         index = launches.length;
         launches.push(Launch({coin: coinAddr, collection: p.collection, creator: msg.sender, tokenId: tokenId, key: key}));
 
-        (bool ok,) = platform.call{value: launchFeeWei}("");
+        (bool ok,) = platform.call{value: fee}("");
         if (!ok) revert FeeSendFailed();
-        if (msg.value > launchFeeWei) {
-            (bool r,) = msg.sender.call{value: msg.value - launchFeeWei}("");
+        if (msg.value > fee) {
+            (bool r,) = msg.sender.call{value: msg.value - fee}("");
             if (!r) revert FeeSendFailed();
         }
         emit CoinLaunched(index, coinAddr, p.collection, msg.sender, p.feePips, p.flywheel, tokenId, creatorTokens, p.devBuyJig, devBuyCoin);

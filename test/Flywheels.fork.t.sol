@@ -334,7 +334,7 @@ contract FlywheelsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // ---------- SnapshotForwarder + HolderPayouts ----------

@@ -160,13 +160,27 @@ Four specialists (math, permissions, economics, control flow) and a judge, 38 mi
 | 8 | Info | keeper modules inside the JIG 5-minute window revert or pay 60% | operational rule, residual-trust list; the keeper job must start after `windowEnd` | |
 | 4, 9, 10, 11 | Info | exact-input buys with real price impact pay above nominal (by construction); L2 notes; hookless pools are fee-free; stale Vesting header | documented; Vesting header corrected | |
 
+## Swarm audit round 4, 16 Oct 2026 (job ae115cf4, public repo ec8476c8)
+
+37 minutes, 0.5 IMD. No critical, high or medium. Two of the three lows were introduced by round-3 fixes. Full report: `swarm-audit-report-4.md`.
+
+| # | Severity | Finding | Fix | Test |
+|---|---|---|---|---|
+| 1 | Low | round 3's `firstCredit` clock let `recycle` sweep fresh credits along with the stale one, and chain creator → flywheel → pot in one block | credits are bucketed by day; `recycle` folds exactly the buckets at least 7 days old and nothing younger; `recyclable(key, who)` shows stale/fresh | `Regressions::test_recycle_takes_only_the_stale_part_and_does_not_chain` |
+| 2 | Low | exact-input buys with real price impact pay the fee at the post-trade price: 2x nominal at half the pool, 10x at 90% (exact-output buys pay exactly f) | **decision pending (Jj)**: see "Open decision" below | |
+| 3 | Low | round 3's `msg.value >= fee` refund removed the creator's bound on the fee: a fee raised before the launch mined took the whole `msg.value` | `LaunchParams.maxFeeWei`: the launch reverts if the fee exceeds it; the fee is read once and used for the check, the payment and the refund (also closes Info 4) | `Regressions::test_launch_fee_above_the_creators_maximum_reverts` |
+| 5 | Info | `_converting` is unreachable: v4 skips `afterSwap` for a hook's own swap | kept as belt and braces; comments and README corrected | |
+| 6 | Info | a coin registered before `setDeepening` could name the future LPDeepening as its flywheel | accepted: `setDeepening` is called in the deploy script before any launch | |
+| 7 | Info | `recycle` re-splits with the platform band of the current fee, not the band when earned; only the platform can lose, after a `lowerFee` | accepted, residual trust | |
+| 8 | Info | `HolderDrip.pull` booked the full amount but the accumulator floors, so up to live−1 wei per pull was owed to nobody | books only what the accumulator can pay; the dust stays undistributed for the next pull | `Regressions::test_holder_drip_rounding_dust_stays_undistributed` |
+
 ## Audit status
 
 **Plan of record, 15 Oct 2026 (Jj):** build the whole contract base on Sepolia first, no audits during the build. Then push the contracts to a throwaway public repo, have the IMD swarm audit the full base from it (the swarm cannot read a private repo and refuses requests with source embedded), fix findings, re-audit, launch nothing, delete the throwaway repo after sign-off. A single 0.5 IMD job can carry several agents, so the brief asks for two independent reviews of the repo inside the job, with the output a compiled list of each reviewer's findings and fixes. When everything has passed, tell Fish the back end is ready and go to mainnet in one sequence: JIG, then the NFT factory, then the creator-coin side. Then make the repo private again. External audit deferred; the fee hook and factory carry every coin's money, so that stays the main open risk.
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 62 passing tests (14 unit, 48 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4: next | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 65 passing tests (14 unit, 51 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4 (job ae115cf4, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 5 info; 2 lows + 2 infos fixed (section above), 1 low awaiting Jj's decision; 65 tests | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 
@@ -190,7 +204,7 @@ Fee split, in basis points of the fee: pot 300 and deepening 200 fixed; platform
 Design notes an auditor should know:
 
 - **Fees are held as ERC-6909 claims inside the PoolManager**, not as ERC-20 in the hook. `take` would fail on a fresh chain because the swapper's input is settled after `afterSwap` runs; claims need no physical balance. `claim()` burns the claims and takes real JIG through an `unlock` callback.
-- **The coin-side conversion is a nested swap on the same pool inside `afterSwap`**, guarded by `_converting` so the nested swap is not charged again. This is the Zora pattern.
+- **The coin-side conversion is a nested swap on the same pool inside `afterSwap`.** It is not charged again because v4's `Hooks.afterSwap` skips callbacks for a hook's own swaps (noSelfCall); the `_converting` flag is belt and braces. This is the Zora pattern.
 - The hook has one-shot `setFactory` and `setDeepening` bindings because the hook, factory and deepening module reference each other. Verify both bindings on chain before trusting a deploy.
 - **Holder drip pays in JIG, not ETH.** The hook holds JIG; converting to ETH per claim would cost every holder a swap. The economics doc said ETH; this is the deviation.
 - **SweepAndBurn trusts the platform keeper to pick the listing.** Which listing is cheapest is not knowable on chain. The contract limits the keeper to real NFTs of the right collection at or under the max price, so the worst case is overpaying for a real burn, never taking funds.

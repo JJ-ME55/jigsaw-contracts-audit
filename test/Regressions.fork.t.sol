@@ -246,7 +246,7 @@ contract RegressionsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // creator allocation + dev buy + settable fee
@@ -279,6 +279,7 @@ contract RegressionsForkTest is Test {
         factory.setLaunchFee(1);
         vm.prank(platform);
         factory.setLaunchFee(0.02 ether);
+        p.maxFeeWei = 0.02 ether; // the creator agrees to the raised fee
         assertEq(factory.launchFeeWei(), 0.02 ether);
         // too much creator allocation refused (checked before anything else)
         p.creatorBps = 501; p.devBuyJig = 0;
@@ -426,6 +427,69 @@ contract RegressionsForkTest is Test {
         _swap(buyer, key, !coinIs0, -10_000e18, "");
         vm.expectRevert(CreatorFeeHook.NotStale.selector);
         hook.recycle(key, creator);
+    }
+
+    // LOW (swarm audit 4): recycle must take only the credits that are 7 days old, never the fresh ones, and must not chain
+    function test_recycle_takes_only_the_stale_part_and_does_not_chain() public {
+        address fly = makeAddr("flywheelWallet");
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, fly);
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -1_000e18, "");
+        uint256 old = hook.claimable(creator);
+        vm.warp(block.timestamp + 7 days + 1);
+        _swap(buyer, key, !coinIs0, -1_000_000e18, ""); // same block as the recycle
+        uint256 freshCreator = hook.claimable(creator) - old;
+        (uint256 stale, uint256 fresh) = hook.recyclable(key, creator);
+        assertEq(stale, old);
+        assertEq(fresh, freshCreator);
+        uint256 flyBefore = hook.claimable(fly);
+        uint256 got = hook.recycle(key, creator);
+        assertEq(got, old, "only the 7-day-old credit was folded");
+        assertEq(hook.claimable(creator), freshCreator, "the fresh credit stays with the creator");
+        assertGt(hook.claimable(fly), flyBefore, "the stale block fed the flywheel");
+        // the block just moved to the flywheel is fresh: recycling the flywheel in the same block takes none of it
+        (uint256 flyStale,) = hook.recyclable(key, fly);
+        if (flyStale == 0) {
+            vm.expectRevert(CreatorFeeHook.NotStale.selector);
+            hook.recycle(key, fly);
+        } else {
+            uint256 g2 = hook.recycle(key, fly);
+            assertLe(g2, flyStale);
+        }
+    }
+
+    // LOW (swarm audit 4): a fee raised after the quote cannot take more than the creator agreed to
+    function test_launch_fee_above_the_creators_maximum_reverts() public {
+        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        bool coinIs0 = predicted < address(jig);
+        uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
+        uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
+        int24 startTick = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lower; int24 upper;
+        if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
+        vm.prank(platform);
+        factory.setLaunchFee(0.5 ether);
+        vm.deal(creator, 1 ether);
+        vm.prank(creator);
+        vm.expectRevert(CoinFactory.WrongFee.selector);
+        factory.launch{value: 0.5 ether}(_params(address(nft), 10_000, address(0), sqrtP, lower, upper)); // maxFeeWei is 0.01
+        vm.prank(platform);
+        factory.setLaunchFee(0.009 ether); // lowered: pays the lower fee, refunds the rest
+        uint256 before = creator.balance;
+        vm.prank(creator);
+        factory.launch{value: 0.01 ether}(_params(address(nft), 10_000, address(0), sqrtP, lower, upper));
+        assertEq(before - creator.balance, 0.009 ether);
+    }
+
+    // INFO (swarm audit 4): the drip books only what the accumulator can pay
+    function test_holder_drip_rounding_dust_stays_undistributed() public {
+        HolderDrip drip = new HolderDrip(address(hook), address(nft));
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -1_000e18, "");
+        drip.pull();
+        assertLt(drip.undistributed(), nft.totalSupply(), "at most live-1 wei left over");
+        assertLe(drip.accounted(), jig.balanceOf(address(drip)));
     }
 
     // INFO (swarm audit 3): a fee update landing before a quoted launch must not revert it

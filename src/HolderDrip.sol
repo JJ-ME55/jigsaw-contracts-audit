@@ -80,7 +80,9 @@ contract HolderDrip is ReentrancyGuard {
         uint256 live = supply > burnedCount ? supply - burnedCount : 0;
         if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
         checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));
-        accPerToken += (amount * ACC) / live;
+        uint256 per = (amount * ACC) / live;
+        accPerToken += per;
+        amount = (per * live) / ACC; // only what the accumulator can actually pay; the rounding dust stays undistributed for the next pull
         accounted += amount;
         emit Pulled(amount, live);
     }

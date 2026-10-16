@@ -85,8 +85,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     mapping(address => uint256) public claimable; // JIG owed, by recipient
     // Per-pool recycle ledger: what creator/flywheel earned on this pool since their last full claim.
     // claimEpoch bumps on every claim/claimFor; entries from an older epoch count as zero.
-    struct Earned { uint128 amount; uint64 epoch; uint64 lastCredit; uint64 firstCredit; } // firstCredit: when the current unclaimed balance started
-    mapping(PoolId => mapping(address => Earned)) public earned;
+    // Credits are bucketed by day so recycle() can take exactly the part that is RECYCLE_AFTER old and nothing
+    // younger: a fresh credit can neither block the stale part (round 2) nor be swept with it (round 3).
+    struct Chunk { uint64 day; uint128 amount; }
+    struct Earned { uint64 epoch; uint64 head; Chunk[] chunks; }
+    mapping(PoolId => mapping(address => Earned)) internal earned;
     mapping(address => uint64) public claimEpoch;
     uint16 public constant DEFAULT_SHARE = type(uint16).max; // register sentinel: default split
     mapping(PoolId => uint256) public pendingCoin; // coin claims not yet converted (partial fills), per pool
@@ -266,11 +269,17 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         address fly = c.flywheel == address(0) ? c.creator : c.flywheel;
         if (from != c.creator && from != fly) revert NotStale();
         Earned storage e = earned[id][from];
-        if (e.epoch != claimEpoch[from] || e.amount == 0) revert NotStale();
-        if (block.timestamp < e.firstCredit + RECYCLE_AFTER) revert NotStale(); // from the first unclaimed credit, so a dust buy cannot reset the clock
-        amount = e.amount;
+        if (e.epoch != claimEpoch[from]) revert NotStale();
+        uint64 cutoff = uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days); // days at or before this are stale
+        uint256 i = e.head;
+        uint256 n = e.chunks.length;
+        while (i < n && e.chunks[i].day <= cutoff) {
+            amount += e.chunks[i].amount;
+            i++;
+        }
+        if (amount == 0) revert NotStale();
+        e.head = uint64(i);
         if (amount > claimable[from]) amount = claimable[from];
-        e.amount = 0;
         claimable[from] -= amount;
         totalClaimable -= amount;
         uint256 potA = (amount * POT_BPS) / 10_000;
@@ -284,6 +293,17 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         else _credit(pot, rest);
         totalClaimable += amount;
         emit Recycled(id, from, amount);
+    }
+
+    /// @notice What `recycle(key, who)` would fold right now (credits at least RECYCLE_AFTER old), and what is younger.
+    function recyclable(PoolKey calldata key, address who) external view returns (uint256 stale, uint256 fresh) {
+        Earned storage e = earned[key.toId()][who];
+        if (e.epoch != claimEpoch[who]) return (0, 0);
+        uint64 cutoff = uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days);
+        for (uint256 i = e.head; i < e.chunks.length; i++) {
+            if (e.chunks[i].day <= cutoff) stale += e.chunks[i].amount;
+            else fresh += e.chunks[i].amount;
+        }
     }
 
     // ---------------- claims ----------------
@@ -336,7 +356,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         returns (bytes4, int128)
     {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
-        if (_converting) return (IHooks.afterSwap.selector, 0);
+        if (_converting) return (IHooks.afterSwap.selector, 0); // belt and braces: v4's Hooks.afterSwap already skips a hook's own swaps (noSelfCall)
         PoolId id = key.toId();
         Config storage c = pools[id];
         if (!c.registered) revert NotRegistered();
@@ -423,10 +443,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (amount == 0) return;
         _credit(to, amount);
         Earned storage e = earned[id][to];
-        if (e.epoch != claimEpoch[to]) { e.epoch = claimEpoch[to]; e.amount = 0; }
-        if (e.amount == 0) e.firstCredit = uint64(block.timestamp);
-        e.amount += uint128(amount);
-        e.lastCredit = uint64(block.timestamp);
+        if (e.epoch != claimEpoch[to]) { e.epoch = claimEpoch[to]; delete e.chunks; e.head = 0; }
+        uint64 day = uint64(block.timestamp / 1 days);
+        uint256 n = e.chunks.length;
+        if (n > e.head && e.chunks[n - 1].day == day) e.chunks[n - 1].amount += uint128(amount);
+        else e.chunks.push(Chunk({day: day, amount: uint128(amount)}));
     }
 
     function _idOf(Config storage c) internal view returns (PoolId) {
