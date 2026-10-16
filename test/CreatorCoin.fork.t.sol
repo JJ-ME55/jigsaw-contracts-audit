@@ -83,8 +83,8 @@ contract CreatorCoinForkTest is Test {
 
     function _launch(uint24 feePips) internal {
         // Decide ordering first: coin address is unknown until deployed, so launch with a price computed for both cases.
-        // Compute the coin address the factory will create: CREATE from factory with its current nonce.
-        address predictedCoin = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        // The address the factory will give the coin: CREATE2 with the collection-bound salt.
+        address predictedCoin = factory.predictCoin(collection, "Cool", "COOL", bytes32(bytes20(collection)));
         coinIs0 = predictedCoin < address(jig);
         // price = currency1 per currency0
         uint256 price = coinIs0 ? 1e18 / COIN_PER_JIG : COIN_PER_JIG * 1e18; // scaled by 1e18 for sqrt
@@ -260,7 +260,7 @@ contract CreatorCoinForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, salt: bytes32(bytes20(collection)), sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

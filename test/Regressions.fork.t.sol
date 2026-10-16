@@ -89,7 +89,7 @@ contract RegressionsForkTest is Test {
     }
 
     function _launchCoin(address who, address flywheel) internal returns (CreatorCoin coin, PoolKey memory key, bool coinIs0) {
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(nft), "Cool", "COOL", bytes32(bytes20(address(nft))));
         coinIs0 = predicted < address(jig);
         uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -274,12 +274,12 @@ contract RegressionsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, salt: bytes32(bytes20(collection)), sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // creator allocation + dev buy + settable fee
     function test_creator_allocation_dev_buy_and_settable_fee() public {
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(nft), "Cool", "COOL", bytes32(bytes20(address(nft))));
         bool coinIs0 = predicted < address(jig);
         uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -326,7 +326,7 @@ contract RegressionsForkTest is Test {
         assertGt(victimBal, 0);
         // attacker launches a junk coin naming the victim as its flywheel
         OwnedNFT junk = new OwnedNFT(squatter);
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(junk), "Cool", "COOL", bytes32(bytes20(address(junk))));
         bool c0 = predicted < address(jig);
         uint256 price = c0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -347,7 +347,7 @@ contract RegressionsForkTest is Test {
         junkCoin;
         // protocol addresses cannot be named as a flywheel at all
         OwnedNFT junk2 = new OwnedNFT(squatter);
-        p.collection = address(junk2); p.flywheel = platform;
+        p.collection = address(junk2); p.salt = bytes32(bytes20(address(junk2))); p.flywheel = platform;
         vm.prank(squatter);
         vm.expectRevert(CreatorFeeHook.BadFlywheel.selector);
         factory.launch{value: 0.01 ether}(p);
@@ -508,7 +508,7 @@ contract RegressionsForkTest is Test {
 
     // LOW (swarm audit 4): a fee raised after the quote cannot take more than the creator agreed to
     function test_launch_fee_above_the_creators_maximum_reverts() public {
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(nft), "Cool", "COOL", bytes32(bytes20(address(nft))));
         bool coinIs0 = predicted < address(jig);
         uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -625,7 +625,7 @@ contract RegressionsForkTest is Test {
 
     // INFO (swarm audit 3): a fee update landing before a quoted launch must not revert it
     function test_launch_overpayment_is_refunded() public {
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(nft), "Cool", "COOL", bytes32(bytes20(address(nft))));
         bool coinIs0 = predicted < address(jig);
         uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -650,6 +650,36 @@ contract RegressionsForkTest is Test {
         bound.setFactory(makeAddr("otherFactory"));
         vm.expectRevert(CoinFactory.BadAirdropRecipient.selector);
         new CoinFactory(POSM, PERMIT2, address(hook), address(jig), platform, address(bound), 0.01 ether);
+    }
+
+    // VANITY (Jj, 16 Oct): coins deploy with CREATE2; the salt is bound to the collection; the address is predictable
+    function test_coin_address_is_create2_with_a_collection_bound_salt() public {
+        // grind a 3-hex-character ending in the test (4096 tries expected) to prove the off-chain grind lands on chain
+        bytes32 h = factory.coinInitCodeHash(address(nft), "Cool", "COOL");
+        bytes32 salt; address want;
+        for (uint96 i = 1; i < 200_000; i++) {
+            salt = bytes32(bytes20(address(nft))) | bytes32(uint256(i));
+            want = address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(factory), salt, h)))));
+            if (uint160(want) & 0xFFF == 0xec7) break;
+        }
+        assertEq(uint160(want) & 0xFFF, 0xec7, "found an ...ec7 salt");
+        assertEq(factory.predictCoin(address(nft), "Cool", "COOL", salt), want);
+        bool coinIs0 = want < address(jig);
+        uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
+        uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
+        int24 st = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lo; int24 hi;
+        if (coinIs0) { lo = (st / 200 + 1) * 200; hi = 887_200; } else { lo = -887_200; hi = (st / 200 - 1) * 200; }
+        CoinFactory.LaunchParams memory p = _params(address(nft), 10_000, address(0), sqrtP, lo, hi);
+        // a salt that is not bound to this collection is refused (mempool copy for another collection)
+        p.salt = bytes32(bytes20(address(0xBEEF))) | bytes32(uint256(1));
+        vm.prank(creator);
+        vm.expectRevert(CoinFactory.BadSalt.selector);
+        factory.launch{value: 0.01 ether}(p);
+        p.salt = salt;
+        vm.prank(creator);
+        (, address coin) = factory.launch{value: 0.01 ether}(p);
+        assertEq(coin, want, "the coin lands exactly where the grind said");
     }
 
     /// expectRevert must sit directly before the swap call (the _swap helper's approve would absorb it)

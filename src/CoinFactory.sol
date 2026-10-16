@@ -67,6 +67,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         uint256 devBuyJig; // JIG the creator spends buying the coin in this transaction, 0 for none (needs approval)
         uint256 devBuyMinCoin; // slippage floor for the dev buy
         uint256 maxFeeWei; // the most the creator agrees to pay as launch fee (the quote plus their tolerance)
+        bytes32 salt; // CREATE2 salt for the coin's address; its first 20 bytes must be the collection (Jj, 16 Oct: every coin ends in c011ec7)
         uint160 sqrtPriceX96; // start price as sqrt(currency1 per currency0) * 2^96, for the pair's ordering
         int24 tickLower; // seeded range, single-sided on the coin
         int24 tickUpper;
@@ -91,6 +92,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     error NotPoolManager();
     error TooMuchCreator();
     error TooLittleOut();
+    error BadSalt();
 
     constructor(address posm_, address permit2_, address hook_, address jig_, address platform_, address airdropRecipient_, uint256 launchFeeWei_) {
         if (posm_ == address(0) || permit2_ == address(0) || hook_ == address(0) || jig_ == address(0) || platform_ == address(0) || airdropRecipient_ == address(0)) revert ZeroAddress();
@@ -126,8 +128,11 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
         if (coinOf[p.collection] != address(0)) revert CollectionHasCoin();
         if (!_controlsCollection(msg.sender, p.collection)) revert NotCollectionOwner();
+        // The salt is bound to the collection, so a salt seen in the mempool is useless for any other launch, and only
+        // the collection's creator can launch for it. The vanity ending is ground off chain; the contract does not check it.
+        if (bytes20(p.salt) != bytes20(p.collection)) revert BadSalt();
 
-        CreatorCoin coin = new CreatorCoin(p.name, p.symbol, SUPPLY, p.collection, address(this));
+        CreatorCoin coin = new CreatorCoin{salt: p.salt}(p.name, p.symbol, SUPPLY, p.collection, address(this));
         coinAddr = address(coin);
         coinOf[p.collection] = coinAddr;
 
@@ -240,6 +245,17 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice The pool key of a collection's coin (zero key if none launched).
+    /// @notice keccak256 of the coin's init code for this collection, name and symbol: what a CREATE2 salt grinder needs.
+    function coinInitCodeHash(address collection, string calldata name, string calldata symbol) public view returns (bytes32) {
+        return keccak256(abi.encodePacked(type(CreatorCoin).creationCode, abi.encode(name, symbol, SUPPLY, collection, address(this))));
+    }
+
+    /// @notice The address launch() will give the coin for these inputs.
+    function predictCoin(address collection, string calldata name, string calldata symbol, bytes32 salt) external view returns (address) {
+        bytes32 h = keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, coinInitCodeHash(collection, name, symbol)));
+        return address(uint160(uint256(h)));
+    }
+
     function keyOf(address collection) external view returns (PoolKey memory) {
         return _keyOf[collection];
     }

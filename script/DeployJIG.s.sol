@@ -11,6 +11,12 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
+/// CreateX, the universal deployer: same address on Sepolia, Ethereum and Robinhood Chain (checked 16 Oct 2026).
+interface ICreateX {
+    function deployCreate3(bytes32 salt, bytes memory initCode) external payable returns (address newContract);
+    function computeCreate3Address(bytes32 salt) external view returns (address computedAddress);
+}
+
 /// Phase 1 deploy: PotVault, JIGLaunch, JIG, Vesting, the launch hook, then the fair launch.
 ///
 /// Sepolia only. ALLOW_MAINNET stays 0 in the back end and this script refuses
@@ -27,6 +33,11 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 ///   ALLOWLIST_ROOT=0x... forge script script/DeployJIG.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
 /// Reads LAUNCH_PK (deployer, launcher), optional POT_OWNER and ALLOWLIST_ROOT.
 /// The hook is deployed with CREATE2 through forge's default deployer so its address carries the flag bits.
+/// JIG_SALT (optional): deploy JIG through CreateX CREATE3 at a vanity address (Jj, 16 Oct: 0x000000...c011ec7).
+/// The salt must start with the deployer's address and have 0x00 as byte 21 (permissioned, no cross-chain
+/// protection), so only this deployer can use it and the address is the same on every chain. Its address depends
+/// only on the salt, so it can be ground before these contracts are final: createxcrunch create3 --caller <deployer>
+/// --crosschain 0 --matching 000000XXXXXXXXXXXXXXXXXXXXXXXXXXXc011ec7
 contract DeployJIG is Script {
     int24 constant TICK_SPACING = 200;
     int24 constant TICK_UPPER = 202_400; // the start tick: price = TickMath.getSqrtPriceAtTick(TICK_UPPER), about 1 ETH = 616M JIG, ~$4k FDV
@@ -34,6 +45,7 @@ contract DeployJIG is Script {
     int24 constant TICK_LOWER = -887_200; // full range below: no cap on price
 
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    address constant CREATEX = 0xba5Ed099633D3B313e4D5F7bdc1305d3c28ba5Ed;
     uint160 constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG);
 
     function run() external {
@@ -49,7 +61,7 @@ contract DeployJIG is Script {
         vm.startBroadcast(pk);
         PotVault pot = new PotVault(potOwner);
         JIGLaunch launch = new JIGLaunch(posm, permit2, deployer, address(pot), platform);
-        JIG jig = new JIG(address(launch), address(pot));
+        JIG jig = _deployJig(deployer, address(launch), address(pot));
         Vesting vesting = new Vesting();
         launch.setJig(address(jig));
 
@@ -75,6 +87,22 @@ contract DeployJIG is Script {
     }
 
     /// Find a CREATE2 salt such that the hook lands on an address whose low 14 bits are exactly HOOK_FLAGS.
+    /// JIG at its vanity address through CreateX when JIG_SALT is set, else a plain CREATE (test deploys).
+    function _deployJig(address deployer, address launch, address pot) internal returns (JIG jig) {
+        bytes32 salt = vm.envOr("JIG_SALT", bytes32(0));
+        if (salt == bytes32(0)) return new JIG(launch, pot);
+        require(address(bytes20(salt)) == deployer && salt[20] == 0x00, "JIG_SALT must start with the deployer address and have byte 21 = 00");
+        address expected = jigAddressFor(deployer, salt);
+        jig = JIG(ICreateX(CREATEX).deployCreate3(salt, abi.encodePacked(type(JIG).creationCode, abi.encode(launch, pot))));
+        require(address(jig) == expected, "JIG did not land at the ground address");
+        console.log("JIG vanity  ", address(jig));
+    }
+
+    /// CreateX's permissioned, cross-chain-identical guard: keccak256(bytes32(deployer) ++ salt).
+    function jigAddressFor(address deployer, bytes32 salt) public view returns (address) {
+        return ICreateX(CREATEX).computeCreate3Address(keccak256(abi.encodePacked(bytes32(uint256(uint160(deployer))), salt)));
+    }
+
     function _mine(bytes memory creationCode, bytes memory args) internal view returns (address addr, bytes32 salt) {
         bytes32 initHash = keccak256(abi.encodePacked(creationCode, args));
         uint256 seed = vm.envOr("SALT_SEED", uint256(0));

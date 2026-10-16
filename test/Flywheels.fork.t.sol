@@ -112,7 +112,7 @@ contract FlywheelsForkTest is Test {
     }
 
     function _launchCoin(address flywheel) internal returns (CreatorCoin coin, PoolKey memory key, bool coinIs0) {
-        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        address predicted = factory.predictCoin(address(nft), "Cool", "COOL", bytes32(bytes20(address(nft))));
         coinIs0 = predicted < address(jig);
         uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
         uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
@@ -334,7 +334,7 @@ contract FlywheelsForkTest is Test {
 
 
     function _params(address collection, uint24 feePips, address flywheel, uint160 sqrtP, int24 lower, int24 upper) internal pure returns (CoinFactory.LaunchParams memory) {
-        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
+        return CoinFactory.LaunchParams({collection: collection, name: "Cool", symbol: "COOL", feePips: feePips, flywheel: flywheel, creatorShareBps: type(uint16).max, creatorBps: 0, devBuyJig: 0, devBuyMinCoin: 0, maxFeeWei: 0.01 ether, salt: bytes32(bytes20(collection)), sqrtPriceX96: sqrtP, tickLower: lower, tickUpper: upper});
     }
 
     // ---------- SnapshotForwarder + HolderPayouts ----------
