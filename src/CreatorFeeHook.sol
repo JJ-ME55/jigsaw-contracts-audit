@@ -382,12 +382,57 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         // seller's own trade just left, about half the exact-input fee on a large unwind (swarm audit 2). Refuse it;
         // routers fall back to exact-input, which pays f of the JIG output directly.
         if (feeIsCoin && params.amountSpecified > 0) revert ExactOutputSell();
-        if (feeIsCoin) jigAmount = _sellCoinForJig(key, c, fee);
+        uint256 charge = fee;
+        if (feeIsCoin) {
+            // Exact-input buy: the fee is coin, and selling f of the buyer's coin back at the price their own trade just
+            // reached recovers far more than f of the JIG they spent (2x at half the pool, swarm audit 4). Convert only
+            // enough coin to recover f of the JIG spent, charge the buyer that much coin, and leave them the rest.
+            uint256 target = (uint256(-params.amountSpecified) * feePips) / PIPS;
+            (jigAmount, charge) = _convertBuyFee(key, c, fee, target);
+        }
 
         hookData;
         _split(c, jigAmount);
         emit FeeTaken(id, jigAmount, feePips);
-        return (IHooks.afterSwap.selector, int128(uint128(fee)));
+        return (IHooks.afterSwap.selector, int128(uint128(charge)));
+    }
+
+    /// @dev Convert the coin fee of an exact-input buy. `fee` coin claims are already minted (the most the buyer can be
+    ///      charged); `target` is f of the JIG they spent. Any coin parked from earlier partial fills is sold first on its
+    ///      own, then an exact-output swap recovers `target` JIG. If the pool gives the whole target, the buyer is charged
+    ///      only the coin that swap spent and the unused claims are burned; if the range edge stopped it short, the buyer
+    ///      is charged the full `fee` and the unconverted coin waits as pendingCoin, as before.
+    function _convertBuyFee(PoolKey calldata key, Config storage c, uint256 fee, uint256 target) internal returns (uint256 jigAmount, uint256 charge) {
+        PoolId id = c.id;
+        bool coinIs0 = c.coinIs0;
+        Currency coin = coinIs0 ? key.currency0 : key.currency1;
+        Currency jigC = coinIs0 ? key.currency1 : key.currency0;
+        if (pendingCoin[id] > 0) jigAmount = _sellCoinForJig(key, c, 0); // earlier leftovers first, on their own
+        uint160 limit = coinIs0 ? TickMath.getSqrtPriceAtTick(c.tickLower) : TickMath.getSqrtPriceAtTick(c.tickUpper);
+        (uint160 spot,,,) = poolManager.getSlot0(id);
+        if (target == 0 || (coinIs0 ? spot <= limit : spot >= limit)) {
+            pendingCoin[id] += fee; // nothing to sell into inside the range right now: charge in full, convert later
+            return (jigAmount, fee);
+        }
+        _converting = true;
+        BalanceDelta d = poolManager.swap(
+            key, SwapParams({zeroForOne: coinIs0, amountSpecified: int256(target), sqrtPriceLimitX96: limit}), ""
+        );
+        _converting = false;
+        uint256 spent = uint256(uint128(-(coinIs0 ? d.amount0() : d.amount1())));
+        uint256 jigOut = uint256(uint128(coinIs0 ? d.amount1() : d.amount0()));
+        if (spent > fee) poolManager.mint(address(this), coin.toId(), spent - fee); // rounding on a zero-impact buy; a wei or two
+        poolManager.burn(address(this), coin.toId(), spent);
+        poolManager.mint(address(this), jigC.toId(), jigOut);
+        jigAmount += jigOut;
+        if (jigOut < target) {
+            // the range edge stopped the conversion: keep the full fee, park what is left
+            charge = fee;
+            if (fee > spent) pendingCoin[id] += fee - spent;
+        } else {
+            charge = spent; // the buyer pays only the coin that recovered f of their JIG
+            if (fee > spent) poolManager.burn(address(this), coin.toId(), fee - spent); // the buyer keeps this coin
+        }
     }
 
     /// @dev Sell `amount` of the coin into the same pool for JIG, inside the current unlock. The sale never leaves the

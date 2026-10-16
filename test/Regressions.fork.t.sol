@@ -429,6 +429,26 @@ contract RegressionsForkTest is Test {
         hook.recycle(key, creator);
     }
 
+    // LOW (swarm audit 4, Jj option a): an exact-input buy pays f of the JIG spent at every size, like an exact-output buy
+    function test_exact_input_buy_pays_nominal_fee_at_every_size() public {
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        uint256[4] memory sizes = [uint256(1_000e18), 100_000e18, 1_000_000e18, 10_000_000e18];
+        for (uint256 i; i < sizes.length; i++) {
+            uint256 snap = vm.snapshotState();
+            uint256 before = hook.totalClaimable();
+            uint256 coinBefore = coin.balanceOf(buyer);
+            _swap(buyer, key, !coinIs0, -int256(sizes[i]), "");
+            uint256 feeJig = hook.totalClaimable() - before;
+            uint256 pending = hook.pendingCoin(key.toId());
+            if (pending == 0) assertApproxEqRel(feeJig, sizes[i] / 100, 0.01e18, "1% of the JIG spent");
+            else assertLe(feeJig, sizes[i] / 100 + 1, "never above nominal");
+            assertGt(coin.balanceOf(buyer) - coinBefore, 0);
+            assertEq(hook.heldJig(), hook.totalClaimable(), "claims match");
+            vm.revertToState(snap);
+        }
+    }
+
     // LOW (swarm audit 4): recycle must take only the credits that are 7 days old, never the fresh ones, and must not chain
     function test_recycle_takes_only_the_stale_part_and_does_not_chain() public {
         address fly = makeAddr("flywheelWallet");
