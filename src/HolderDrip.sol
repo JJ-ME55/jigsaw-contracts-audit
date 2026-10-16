@@ -45,7 +45,9 @@ contract HolderDrip is ReentrancyGuard {
     uint256 public accPerToken; // JIG accrued per live NFT, scaled by ACC
     uint256 public accounted; // JIG ever distributed into accPerToken
     uint256 public paidOut; // JIG ever paid to holders or swept to the pot
-    uint256 public burnedCount;
+    uint256 public burnedCount; // burned tokens among the eligible supply
+    uint256 public lastSupply; // collection supply at the previous pull: the supply this pull's JIG is spread over
+    uint256[] private _burnedAbove; // burned before they were ever eligible; folded into burnedCount once lastSupply covers them
     Checkpoint[] public checkpoints;
     mapping(uint256 tokenId => uint256) private _paidPerToken;
     mapping(uint256 tokenId => bool) private _seen;
@@ -76,7 +78,13 @@ contract HolderDrip is ReentrancyGuard {
     function pull() external nonReentrant returns (uint256 amount) {
         hook.claim();
         amount = undistributed();
-        uint256 supply = collection.totalSupply();
+        // Spread over the supply the previous pull recorded, not today's: JIG that accrued since then belongs to the
+        // tokens that existed then. A token minted since starts earning from the next pull (swarm audit 6). The
+        // first pull uses the current supply.
+        uint256 supply = lastSupply == 0 ? collection.totalSupply() : lastSupply;
+        uint256 current = collection.totalSupply();
+        lastSupply = current;
+        _foldBurns(current);
         uint256 live = supply > burnedCount ? supply - burnedCount : 0;
         if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
         checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));
@@ -109,12 +117,16 @@ contract HolderDrip is ReentrancyGuard {
 
     /// @notice Claim for the tokens the caller owns. Reverts if any token is not theirs.
     function claim(uint256[] calldata tokenIds) external nonReentrant returns (uint256 total) {
+        // a token no checkpoint covers yet keeps its baseline open: fixing it now would let it earn from a pull it was not in
+        uint256 covered = checkpoints.length == 0 ? 0 : checkpoints[checkpoints.length - 1].supply;
         for (uint256 i; i < tokenIds.length; i++) {
             uint256 id = tokenIds[i];
             if (collection.ownerOf(id) != msg.sender) revert NotOwner();
             total += owed(id);
-            _paidPerToken[id] = accPerToken;
-            _seen[id] = true;
+            if (id <= covered) {
+                _paidPerToken[id] = accPerToken;
+                _seen[id] = true;
+            }
         }
         if (total > 0) {
             paidOut += total;
@@ -132,12 +144,28 @@ contract HolderDrip is ReentrancyGuard {
         isBurned[tokenId] = true;
         _paidPerToken[tokenId] = accPerToken;
         _seen[tokenId] = true;
-        burnedCount++;
+        if (tokenId <= lastSupply) burnedCount++;
+        else _burnedAbove.push(tokenId); // not yet in any pull's supply; counted once it is
         if (stranded > 0) {
             paidOut += stranded;
             jig.safeTransfer(pot, stranded);
         }
         emit MarkedBurned(tokenId, stranded);
+    }
+
+    /// @dev Move burns that `supply` now covers into burnedCount. Bounded by tokens burned before their first pull.
+    function _foldBurns(uint256 supply) internal {
+        uint256 n = _burnedAbove.length;
+        for (uint256 i; i < n;) {
+            if (_burnedAbove[i] <= supply) {
+                burnedCount++;
+                _burnedAbove[i] = _burnedAbove[n - 1];
+                _burnedAbove.pop();
+                n--;
+            } else {
+                i++;
+            }
+        }
     }
 
     function checkpointCount() external view returns (uint256) {

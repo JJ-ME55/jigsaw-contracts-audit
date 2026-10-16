@@ -271,7 +271,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (from != c.creator && from != fly) revert NotStale();
         Earned storage e = earned[id][from];
         if (e.epoch != claimEpoch[from]) revert NotStale();
-        uint64 cutoff = _staleCutoff();
+        (bool any, uint64 cutoff) = _staleCutoff();
+        if (!any) revert NotStale();
         uint256 i = e.head;
         uint256 n = e.chunks.length;
         if (n > i + MAX_FOLD) n = i + MAX_FOLD; // bounded per call; call again for the rest
@@ -299,17 +300,20 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
 
     /// @dev A day bucket is stale once every second of it is at least RECYCLE_AFTER old: day <= today - 7 - 1. So the
     ///      grace is 7 to 8 days depending on the time of day the fee was earned, never less than 7 (swarm audit 5).
-    function _staleCutoff() internal view returns (uint64) {
-        return uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days) - 1;
+    function _staleCutoff() internal view returns (bool any, uint64 cutoff) {
+        uint64 today = uint64(block.timestamp / 1 days);
+        uint64 back = uint64(RECYCLE_AFTER / 1 days) + 1;
+        if (today < back) return (false, 0); // a chain younger than the grace (local harnesses): nothing can be stale
+        return (true, today - back);
     }
 
     /// @notice What `recycle(key, who)` would fold right now (credits at least RECYCLE_AFTER old), and what is younger.
     function recyclable(PoolKey calldata key, address who) external view returns (uint256 stale, uint256 fresh) {
         Earned storage e = earned[key.toId()][who];
         if (e.epoch != claimEpoch[who]) return (0, 0);
-        uint64 cutoff = _staleCutoff();
+        (bool any, uint64 cutoff) = _staleCutoff();
         for (uint256 i = e.head; i < e.chunks.length; i++) {
-            if (e.chunks[i].day <= cutoff) stale += e.chunks[i].amount;
+            if (any && e.chunks[i].day <= cutoff) stale += e.chunks[i].amount;
             else fresh += e.chunks[i].amount;
         }
     }
@@ -420,7 +424,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (pendingCoin[id] > 0) jigAmount = _sellCoinForJig(key, c, 0); // earlier leftovers first, on their own
         uint160 limit = coinIs0 ? TickMath.getSqrtPriceAtTick(c.tickLower) : TickMath.getSqrtPriceAtTick(c.tickUpper);
         (uint160 spot,,,) = poolManager.getSlot0(id);
-        if (target == 0 || (coinIs0 ? spot <= limit : spot >= limit)) {
+        if (target == 0) {
+            poolManager.burn(address(this), coin.toId(), fee); // a buy too small to owe any JIG is charged no coin
+            return (jigAmount, 0);
+        }
+        if (coinIs0 ? spot <= limit : spot >= limit) {
             pendingCoin[id] += fee; // nothing to sell into inside the range right now: charge in full, convert later
             return (jigAmount, fee);
         }

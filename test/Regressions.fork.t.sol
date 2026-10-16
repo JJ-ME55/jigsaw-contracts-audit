@@ -197,11 +197,39 @@ contract RegressionsForkTest is Test {
         vm.prank(holderA);
         uint256 got = drip.claim(a);
         assertApproxEqAbs(got, perToken * 4, 4, "original holders get everything");
-        // a second pull is split over all 8
+        // the next pull still spreads over the 4 the previous pull saw (round 6); the one after that over all 8
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        drip.pull();
+        assertEq(drip.owed(5), 0, "first pull after the mint: nothing yet");
         _swap(buyer, key, !coinIs0, -100_000e18, "");
         drip.pull();
         assertGt(drip.owed(5), 0);
-        assertApproxEqAbs(drip.owed(5), drip.owed(1), 2);
+        uint256 lateShare = drip.owed(5);
+        uint256 origShareSinceClaim = drip.owed(1);
+        assertGt(origShareSinceClaim, lateShare, "original tokens earned the middle pull too");
+    }
+
+    // LOW (swarm audit 6): a mint right before a pull must not take JIG that accrued before it existed
+    function test_mint_right_before_a_pull_takes_nothing_from_it() public {
+        HolderDrip drip = new HolderDrip(address(hook), address(nft));
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        drip.pull(); // 4 tokens seen
+        _swap(buyer, key, !coinIs0, -100_000e18, ""); // accrues to the drip
+        nft.mint(late, 96); // ids 5..100, minted just before the pull
+        drip.pull();
+        assertEq(drip.owed(5), 0, "late minter gets nothing from JIG that accrued before the mint");
+        assertGt(drip.owed(1), 0);
+        // a token burned before its first pull is never counted as live
+        address dead = drip.DEAD();
+        vm.prank(late);
+        nft.transferFrom(late, dead, 100);
+        drip.markBurned(100);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        drip.pull(); // now spread over ids 1..100 minus the burned one
+        assertEq(drip.burnedCount(), 1);
+        assertLe(drip.accounted() - drip.paidOut(), jig.balanceOf(address(drip)), "solvent");
     }
 
     // HIGH (second pass): claimFor could strand the drip's slice
@@ -543,6 +571,19 @@ contract RegressionsForkTest is Test {
         // a huge request with a tight limit on a young pool must not revert
         vm.prank(buyer);
         swapper.swap(key, SwapParams({zeroForOne: !coinIs0, amountSpecified: -int256(1_000_000e18), sqrtPriceLimitX96: limitPrice}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        assertEq(hook.heldJig(), hook.totalClaimable());
+    }
+
+    // INFO (swarm audit 6): a buy too small to owe any JIG is charged no coin
+    function test_dust_buy_is_charged_nothing() public {
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -1_000e18, "");
+        uint256 pendingBefore = hook.pendingCoin(key.toId());
+        uint256 coinBefore = coin.balanceOf(buyer);
+        _swap(buyer, key, !coinIs0, -50, ""); // 50 wei of JIG
+        assertEq(hook.pendingCoin(key.toId()), pendingBefore, "nothing parked");
+        assertGt(coin.balanceOf(buyer), coinBefore);
         assertEq(hook.heldJig(), hook.totalClaimable());
     }
 
