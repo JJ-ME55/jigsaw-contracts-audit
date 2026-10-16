@@ -172,7 +172,19 @@ Four specialists (math, permissions, economics, control flow) and a judge, 38 mi
 | 5 | Info | `_converting` is unreachable: v4 skips `afterSwap` for a hook's own swap | kept as belt and braces; comments and README corrected | |
 | 6 | Info | a coin registered before `setDeepening` could name the future LPDeepening as its flywheel | accepted: `setDeepening` is called in the deploy script before any launch | |
 | 7 | Info | `recycle` re-splits with the platform band of the current fee, not the band when earned; only the platform can lose, after a `lowerFee` | accepted, residual trust | |
-| 8 | Info | `HolderDrip.pull` booked the full amount but the accumulator floors, so up to live−1 wei per pull was owed to nobody | books only what the accumulator can pay; the dust stays undistributed for the next pull | `Regressions::test_holder_drip_rounding_dust_stays_undistributed` |
+| 8 | Info | `HolderDrip.pull` booked the full amount but the accumulator floors, so up to live−1 wei per pull was owed to nobody | ~~books only what the accumulator can pay~~ **reverted in round 5**: that change bricked the drip (High below). Full booking is correct; the dust is unclaimable by design | |
+
+## Swarm audit round 5, 16 Oct 2026 (job 374e2a1a, public repo cfd5cb83)
+
+45 minutes, 0.5 IMD. Every finding was in code written for round 4; the base from round 3 was clean. Full report: `swarm-audit-report-5.md`.
+
+| # | Severity | Finding | Fix | Test |
+|---|---|---|---|---|
+| 1 | **High** | round 4's "book only what the accumulator can pay" let per-token claims exceed `accounted`, so `undistributed()` underflowed and `pull()` bricked for good | reverted: book the full amount (sum of per-token floors is always ≤ it) | `Regressions::test_holder_drip_survives_lossy_pulls_and_claims` |
+| 2 | Medium | the fee cap sized the conversion from the JIG *requested*, not spent: a price-limited buy paid f of the request (5x), and a large request on a young pool reverted `CurrencyNotSettled` | target = f of the specified-side delta (JIG actually spent); the partial-fill branch charges max(fee, spent) so the hook is never short of claims | `Regressions::test_partial_exact_input_buy_pays_f_of_what_it_spent` |
+| 3 | Low | day buckets made the grace as short as 6 days + 1 s | a bucket is stale only when its last second is 7 days old: grace is 7 to 8 days, never less | `Regressions::test_recycle_grace_is_never_under_seven_days` |
+| 4 | Low | a claim made the next swapper pay to `delete` the whole ledger (4.4M gas after 400 idle days) | old entries are abandoned by moving `head`, never deleted; `recycle` folds at most 64 buckets per call | `Regressions::test_claim_does_not_make_the_next_swap_delete_the_ledger` |
+| 5 | Info | anyone can `claimFor(creator)` the block before a recycle, so recycling is a liveness backstop, not an enforceable redistribution | accepted and documented; funds only ever reach the credited address | |
 
 ## Audit status
 
@@ -180,7 +192,7 @@ Four specialists (math, permissions, economics, control flow) and a judge, 38 mi
 
 | Contract | Written by | Swarm audit | External audit |
 |---|---|---|---|
-| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 66 passing tests (14 unit, 52 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4 (job ae115cf4, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 5 info; all fixed (section above); 66 tests | before mainnet |
+| JIG, Vesting, PotVault, JIGLaunch, JIGLaunchHook, CreatorFeeHook, CoinFactory, CreatorCoin, HolderDrip, AirdropClaim, SweepAndBurn, BuybackAndBurn, LPDeepening | Claude, 15 Oct, with 69 passing tests (14 unit, 55 on a Sepolia fork), three adversarial review passes and the checklist audit above. The NFT collection and factory stay as the swarm wrote and audited them at launch 1746 (the v2 referral was dropped) | swarm audit 1 (job fbe44d90, 15 Oct, 0.5 IMD): 1 High (dust order outside the range captured the nested fee conversion), 5 Medium/Low, all fixed and pinned by `test/Regressions.fork.t.sol::test_dust_order_outside_range_cannot_capture_the_fee`; see `swarm-audit-report.md`. Full set redeployed 16 Oct after each round (addresses above). Swarm audit 2 (job 489901b6, 16 Oct, 0.5 IMD): no critical/high, 3 medium, 3 low, all fixed (section above); 58 tests. Round 3 (job 0c246e1d, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 8 info, all fixed (section above); 62 tests. Round 4 (job ae115cf4, 16 Oct, 0.5 IMD): no critical/high/medium, 3 low, 5 info; all fixed. Round 5 (job 374e2a1a): 1 High, 1 Medium, 2 Low, 1 Info, every one in round-4 code, all fixed (section above); 69 tests. Round 6: next | before mainnet |
 
 Audit scope notes for whoever runs it: JIGLaunch's `collectFees` encodes `DECREASE_LIQUIDITY` with zero liquidity then `TAKE_PAIR`; check the PositionManager version on the target chain still treats that as fee collection. PotVault leaf format is `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` (OpenZeppelin standard double hash).
 

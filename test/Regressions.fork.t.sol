@@ -416,7 +416,7 @@ contract RegressionsForkTest is Test {
         vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -10_000e18, "");
         assertGt(hook.claimable(creator), 0);
-        vm.warp(block.timestamp + 7 days + 1);
+        vm.warp(block.timestamp + 8 days);
         _swap(buyer, key, !coinIs0, -1e12, ""); // dust credit on the stale balance
         uint256 got = hook.recycle(key, creator);
         assertGt(got, 0, "recycled despite the dust refresh");
@@ -456,7 +456,7 @@ contract RegressionsForkTest is Test {
         vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -1_000e18, "");
         uint256 old = hook.claimable(creator);
-        vm.warp(block.timestamp + 7 days + 1);
+        vm.warp(block.timestamp + 8 days);
         _swap(buyer, key, !coinIs0, -1_000_000e18, ""); // same block as the recycle
         uint256 freshCreator = hook.claimable(creator) - old;
         (uint256 stale, uint256 fresh) = hook.recyclable(key, creator);
@@ -501,15 +501,85 @@ contract RegressionsForkTest is Test {
         assertEq(before - creator.balance, 0.009 ether);
     }
 
-    // INFO (swarm audit 4): the drip books only what the accumulator can pay
-    function test_holder_drip_rounding_dust_stays_undistributed() public {
-        HolderDrip drip = new HolderDrip(address(hook), address(nft));
-        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
+    // HIGH (swarm audit 5): booking only the floored per-pull amount let per-token claims exceed it and bricked pull()
+    function test_holder_drip_survives_lossy_pulls_and_claims() public {
+        OwnedNFT three = new OwnedNFT(creator);
+        three.mint(holderA, 3); // 3 live tokens: 1e18 / 3 never divides
+        HolderDrip drip = new HolderDrip(address(hook), address(three));
+        for (uint256 i; i < 4; i++) {
+            vm.prank(buyer);
+            jig.transfer(address(drip), 1e18);
+            drip.pull();
+        }
+        uint256[] memory ids = new uint256[](3);
+        ids[0] = 1; ids[1] = 2; ids[2] = 3;
+        vm.prank(holderA);
+        drip.claim(ids);
+        assertLe(drip.paidOut(), drip.accounted(), "claims never exceed what was booked");
+        vm.prank(buyer);
+        jig.transfer(address(drip), 1e18);
+        assertGt(drip.pull(), 0, "the drip keeps working after lossy pulls and a full claim");
+        assertLe(drip.accounted() - drip.paidOut(), jig.balanceOf(address(drip)), "always solvent");
+    }
+
+    // MEDIUM (swarm audit 5): a price-limited exact-input buy pays f of the JIG it actually spent, and never reverts
+    function test_partial_exact_input_buy_pays_f_of_what_it_spent() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
         vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        // find the price a 10k buy reaches, then ask for 50k with that as the limit
+        uint256 snap = vm.snapshotState();
+        _swap(buyer, key, !coinIs0, -10_000e18, "");
+        (uint160 limitPrice,,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
+        vm.revertToState(snap);
+        uint256 before = hook.totalClaimable();
+        uint256 jigBefore = jig.balanceOf(buyer);
+        vm.prank(buyer);
+        swapper.swap(key, SwapParams({zeroForOne: !coinIs0, amountSpecified: -int256(50_000e18), sqrtPriceLimitX96: limitPrice}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        uint256 spentJig = jigBefore - jig.balanceOf(buyer);
+        assertLt(spentJig, 20_000e18, "the limit cut the fill well short of 50k");
+        assertApproxEqRel(hook.totalClaimable() - before, spentJig / 100, 0.01e18, "1% of the JIG actually spent");
+        assertEq(hook.heldJig(), hook.totalClaimable());
+        // a huge request with a tight limit on a young pool must not revert
+        vm.prank(buyer);
+        swapper.swap(key, SwapParams({zeroForOne: !coinIs0, amountSpecified: -int256(1_000_000e18), sqrtPriceLimitX96: limitPrice}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        assertEq(hook.heldJig(), hook.totalClaimable());
+    }
+
+    // LOW (swarm audit 5): the recycle grace is never under 7 days, whatever the time of day the fee was earned
+    function test_recycle_grace_is_never_under_seven_days() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(((block.timestamp / 1 days) + 1) * 1 days - 1); // last second of a UTC day
         _swap(buyer, key, !coinIs0, -1_000e18, "");
-        drip.pull();
-        assertLt(drip.undistributed(), nft.totalSupply(), "at most live-1 wei left over");
-        assertLe(drip.accounted(), jig.balanceOf(address(drip)));
+        vm.warp(block.timestamp + 6 days + 1);
+        vm.expectRevert(CreatorFeeHook.NotStale.selector);
+        hook.recycle(key, creator);
+        vm.warp(block.timestamp + 1 days - 1); // exactly 7 days after the credit
+        (uint256 stale,) = hook.recyclable(key, creator);
+        if (stale == 0) vm.warp(block.timestamp + 1 days); // the bucket rule may take up to a day more
+        assertGt(hook.recycle(key, creator), 0);
+    }
+
+    // LOW (swarm audit 5): a claim must not make the next swapper pay to delete a long ledger
+    function test_claim_does_not_make_the_next_swap_delete_the_ledger() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        for (uint256 d; d < 60; d++) {
+            _swap(buyer, key, !coinIs0, -100e18, "");
+            vm.warp(vm.getBlockTimestamp() + 1 days);
+        }
+        vm.prank(creator);
+        hook.claim();
+        vm.startPrank(buyer);
+        jig.approve(address(swapper), type(uint256).max);
+        uint256 g0 = gasleft();
+        swapper.swap(key, SwapParams({zeroForOne: !coinIs0, amountSpecified: -int256(100e18), sqrtPriceLimitX96: !coinIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1}), PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), "");
+        uint256 used = g0 - gasleft();
+        vm.stopPrank();
+        assertLt(used, 700_000, "no ledger delete inside the swap");
+        (uint256 stale, uint256 fresh) = hook.recyclable(key, creator);
+        assertEq(stale, 0, "old entries abandoned at the claim");
+        assertGt(fresh, 0);
     }
 
     // INFO (swarm audit 3): a fee update landing before a quoted launch must not revert it

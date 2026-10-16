@@ -67,6 +67,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     uint24 public constant SNIPE_FEE = 600_000;
     uint64 public constant SNIPE_WINDOW = 10 seconds;
     uint64 public constant RECYCLE_AFTER = 7 days;
+    uint256 internal constant MAX_FOLD = 64; // day buckets folded per recycle() call
     uint256 internal constant PIPS = 1_000_000;
 
     uint16 public constant DEFAULT_FLYWHEEL_BPS = 2000;
@@ -270,9 +271,10 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (from != c.creator && from != fly) revert NotStale();
         Earned storage e = earned[id][from];
         if (e.epoch != claimEpoch[from]) revert NotStale();
-        uint64 cutoff = uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days); // days at or before this are stale
+        uint64 cutoff = _staleCutoff();
         uint256 i = e.head;
         uint256 n = e.chunks.length;
+        if (n > i + MAX_FOLD) n = i + MAX_FOLD; // bounded per call; call again for the rest
         while (i < n && e.chunks[i].day <= cutoff) {
             amount += e.chunks[i].amount;
             i++;
@@ -295,11 +297,17 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         emit Recycled(id, from, amount);
     }
 
+    /// @dev A day bucket is stale once every second of it is at least RECYCLE_AFTER old: day <= today - 7 - 1. So the
+    ///      grace is 7 to 8 days depending on the time of day the fee was earned, never less than 7 (swarm audit 5).
+    function _staleCutoff() internal view returns (uint64) {
+        return uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days) - 1;
+    }
+
     /// @notice What `recycle(key, who)` would fold right now (credits at least RECYCLE_AFTER old), and what is younger.
     function recyclable(PoolKey calldata key, address who) external view returns (uint256 stale, uint256 fresh) {
         Earned storage e = earned[key.toId()][who];
         if (e.epoch != claimEpoch[who]) return (0, 0);
-        uint64 cutoff = uint64(block.timestamp / 1 days) - uint64(RECYCLE_AFTER / 1 days);
+        uint64 cutoff = _staleCutoff();
         for (uint256 i = e.head; i < e.chunks.length; i++) {
             if (e.chunks[i].day <= cutoff) stale += e.chunks[i].amount;
             else fresh += e.chunks[i].amount;
@@ -387,7 +395,9 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
             // Exact-input buy: the fee is coin, and selling f of the buyer's coin back at the price their own trade just
             // reached recovers far more than f of the JIG they spent (2x at half the pool, swarm audit 4). Convert only
             // enough coin to recover f of the JIG spent, charge the buyer that much coin, and leave them the rest.
-            uint256 target = (uint256(-params.amountSpecified) * feePips) / PIPS;
+            // f of the JIG the buyer actually spent (the specified-side delta): a price limit can fill less than asked
+            int128 spec = specifiedIs0 ? delta.amount0() : delta.amount1();
+            uint256 target = (uint256(uint128(-spec)) * feePips) / PIPS;
             (jigAmount, charge) = _convertBuyFee(key, c, fee, target);
         }
 
@@ -426,8 +436,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         poolManager.mint(address(this), jigC.toId(), jigOut);
         jigAmount += jigOut;
         if (jigOut < target) {
-            // the range edge stopped the conversion: keep the full fee, park what is left
-            charge = fee;
+            // the range edge stopped the conversion: keep the full fee (or what the swap spent, if more), park what is left
+            charge = spent > fee ? spent : fee;
             if (fee > spent) pendingCoin[id] += fee - spent;
         } else {
             charge = spent; // the buyer pays only the coin that recovered f of their JIG
@@ -488,7 +498,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (amount == 0) return;
         _credit(to, amount);
         Earned storage e = earned[id][to];
-        if (e.epoch != claimEpoch[to]) { e.epoch = claimEpoch[to]; delete e.chunks; e.head = 0; }
+        if (e.epoch != claimEpoch[to]) { e.epoch = claimEpoch[to]; e.head = uint64(e.chunks.length); } // old entries are abandoned, never deleted: a delete would cost the next swapper ~5k gas per idle day
         uint64 day = uint64(block.timestamp / 1 days);
         uint256 n = e.chunks.length;
         if (n > e.head && e.chunks[n - 1].day == day) e.chunks[n - 1].amount += uint128(amount);

@@ -229,7 +229,7 @@ contract CreatorCoinForkTest is Test {
         // unclaimed for 7 days: anyone folds it back through the split
         vm.expectRevert(CreatorFeeHook.NotStale.selector);
         hook.recycle(key, creator);
-        vm.warp(block.timestamp + 7 days + 1);
+        vm.warp(block.timestamp + 8 days); // grace is 7 to 8 days by day bucket (round 5)
         uint256 stale = hook.claimable(creator);
         hook.recycle(key, creator);
         assertEq(hook.claimable(creator), 0, "the creator who let it go stale gets nothing back");

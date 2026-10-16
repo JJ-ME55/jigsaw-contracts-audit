@@ -80,9 +80,10 @@ contract HolderDrip is ReentrancyGuard {
         uint256 live = supply > burnedCount ? supply - burnedCount : 0;
         if (live == 0 || amount == 0) return 0; // stays undistributed until there is a live token
         checkpoints.push(Checkpoint({supply: uint96(supply), accBefore: uint160(accPerToken)}));
-        uint256 per = (amount * ACC) / live;
-        accPerToken += per;
-        amount = (per * live) / ACC; // only what the accumulator can actually pay; the rounding dust stays undistributed for the next pull
+        accPerToken += (amount * ACC) / live;
+        // Book the full amount. Per-token claims floor their own share, so sum(owed) <= accounted always holds and the
+        // per-pull rounding dust (< 1 wei per token) is simply unclaimable. Booking only floor(per*live) instead
+        // (round 4) let sum(owed) exceed accounted and bricked pull() with an underflow (swarm audit 5, High).
         accounted += amount;
         emit Pulled(amount, live);
     }
