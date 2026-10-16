@@ -88,7 +88,7 @@ contract FlywheelsForkTest is Test {
         vm.stopPrank();
         jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 15_000, tickSpacing: 200, hooks: IHooks(address(0))});
 
-        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xF1F1) << 20));
+        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xF1F1) << 20));
         deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         airdrop = new AirdropClaim(platform, address(pot));
@@ -323,9 +323,11 @@ contract FlywheelsForkTest is Test {
         uint128 liq1 = IPositionManager(POSM).getPositionLiquidity(deep.tokenId());
         vm.prank(buyer);
         jig.transfer(address(deep), 500_000e18);
+        uint256 jigBefore = jig.balanceOf(address(pot)) + jig.balanceOf(platform);
         vm.prank(platform);
         deep.run(1); // must not revert and must pay the fees out first
         assertGt(address(pot).balance + platform.balance, before, "accrued LP fees reached team and pot");
+        assertGt(jig.balanceOf(address(pot)) + jig.balanceOf(platform), jigBefore, "the run's own sale fee reached team and pot too (round 3)");
         assertGt(IPositionManager(POSM).getPositionLiquidity(deep.tokenId()), liq1, "and the run still deepened");
         assertEq(deep.platformOwedEth(), 0);
     }

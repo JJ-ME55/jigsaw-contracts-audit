@@ -71,7 +71,7 @@ contract RegressionsForkTest is Test {
         launch.launch(15_000, 200, address(0), TickMath.getSqrtPriceAtTick(202_400), -887_200, 202_400);
         vm.stopPrank();
         jigKey = PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(jig)), fee: 15_000, tickSpacing: 200, hooks: IHooks(address(0))});
-        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xC0DE) << 20));
+        address hookAddr = address(uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG) | (uint160(0xC0DE) << 20));
         deployCodeTo("CreatorFeeHook.sol:CreatorFeeHook", abi.encode(POOL_MANAGER, address(jig), owner, platform, address(pot)), hookAddr);
         hook = CreatorFeeHook(hookAddr);
         airdrop = new AirdropClaim(platform, address(pot));
@@ -354,6 +354,7 @@ contract RegressionsForkTest is Test {
         vm.startPrank(buyer);
         jig.approve(address(lp), type(uint256).max);
         coin.approve(address(lp), type(uint256).max);
+        vm.expectRevert(); // since round 3 a creator pool takes no liquidity but the factory's seed
         lp.modifyLiquidity(key, ModifyLiquidityParams({tickLower: lo, tickUpper: hi, liquidityDelta: 1e15, salt: 0}), "");
         vm.stopPrank();
         // the exact-output sell the attack used is refused outright now (swarm audit 2: it also underpaid the fee)
@@ -387,6 +388,73 @@ contract RegressionsForkTest is Test {
         assertApproxEqRel(feeTaken, (out + feeTaken) / 100, 0.01e18, "1% of the gross JIG output");
         // exact-output BUYS are still fine (fee in JIG, charged on top)
         _swap(buyer, key, !coinIs0, int256(1_000e18), "");
+    }
+
+    // LOW (swarm audit 3): an LP band inside the range traded coin for JIG at spot with no fee and no anti-snipe
+    function test_creator_pool_takes_no_liquidity_but_the_seed() public {
+        (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        _swap(buyer, key, !coinIs0, -100_000e18, "");
+        PoolModifyLiquidityTest lp = new PoolModifyLiquidityTest(IPoolManager(POOL_MANAGER));
+        (, int24 tick,,) = IPoolManager(POOL_MANAGER).getSlot0(key.toId());
+        int24 lo = (tick / 200) * 200 - 200;
+        vm.startPrank(buyer);
+        jig.approve(address(lp), type(uint256).max);
+        coin.approve(address(lp), type(uint256).max);
+        vm.expectRevert();
+        lp.modifyLiquidity(key, ModifyLiquidityParams({tickLower: lo, tickUpper: lo + 400, liquidityDelta: 1e15, salt: 0}), "");
+        vm.warp(block.timestamp + 365 days); // never, not just during the snipe window
+        vm.expectRevert();
+        lp.modifyLiquidity(key, ModifyLiquidityParams({tickLower: lo, tickUpper: lo + 400, liquidityDelta: 1e15, salt: 0}), "");
+        vm.stopPrank();
+        assertEq(IPoolManager(POOL_MANAGER).getLiquidity(key.toId()) > 0, true, "the factory's seed is still there");
+    }
+
+    // INFO (swarm audit 3): a dust buy every 7 days could keep a stale balance from ever being recycled
+    function test_recycle_clock_runs_from_the_first_unclaimed_credit() public {
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        _swap(buyer, key, !coinIs0, -10_000e18, "");
+        assertGt(hook.claimable(creator), 0);
+        vm.warp(block.timestamp + 7 days + 1);
+        _swap(buyer, key, !coinIs0, -1e12, ""); // dust credit on the stale balance
+        uint256 got = hook.recycle(key, creator);
+        assertGt(got, 0, "recycled despite the dust refresh");
+        // a fresh balance after a claim starts a new clock
+        _swap(buyer, key, !coinIs0, -10_000e18, "");
+        vm.prank(creator);
+        hook.claim();
+        _swap(buyer, key, !coinIs0, -10_000e18, "");
+        vm.expectRevert(CreatorFeeHook.NotStale.selector);
+        hook.recycle(key, creator);
+    }
+
+    // INFO (swarm audit 3): a fee update landing before a quoted launch must not revert it
+    function test_launch_overpayment_is_refunded() public {
+        address predicted = vm.computeCreateAddress(address(factory), vm.getNonce(address(factory)));
+        bool coinIs0 = predicted < address(jig);
+        uint256 price = coinIs0 ? 1e18 / 1000 : 1000 * 1e18;
+        uint160 sqrtP = uint160((_sqrt(price) * (1 << 96)) / 1e9);
+        int24 startTick = TickMath.getTickAtSqrtPrice(sqrtP);
+        int24 lower; int24 upper;
+        if (coinIs0) { lower = (startTick / 200 + 1) * 200; upper = 887_200; } else { lower = -887_200; upper = (startTick / 200 - 1) * 200; }
+        uint256 before = creator.balance;
+        uint256 platformBefore = platform.balance;
+        vm.prank(creator);
+        factory.launch{value: 0.015 ether}(_params(address(nft), 10_000, address(0), sqrtP, lower, upper));
+        assertEq(before - creator.balance, 0.01 ether, "paid exactly the fee");
+        assertEq(platform.balance - platformBefore, 0.01 ether);
+        vm.prank(creator);
+        vm.expectRevert(CoinFactory.WrongFee.selector);
+        factory.launch{value: 0.009 ether}(_params(address(nft), 10_000, address(0), sqrtP, lower, upper));
+    }
+
+    // LOW (swarm audit 3): a factory built on an AirdropClaim already bound elsewhere could never launch
+    function test_factory_refuses_an_airdrop_claim_bound_to_another_factory() public {
+        AirdropClaim bound = new AirdropClaim(platform, address(pot));
+        vm.prank(platform);
+        bound.setFactory(makeAddr("otherFactory"));
+        vm.expectRevert(CoinFactory.BadAirdropRecipient.selector);
+        new CoinFactory(POSM, PERMIT2, address(hook), address(jig), platform, address(bound), 0.01 ether);
     }
 
     /// expectRevert must sit directly before the swap call (the _swap helper's approve would absorb it)

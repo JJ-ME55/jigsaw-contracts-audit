@@ -16,7 +16,7 @@ import {AirdropClaim} from "../src/AirdropClaim.sol";
 ///   JIG=0x... POT=0x... forge script script/DeployCoins.s.sol --rpc-url sepolia --broadcast --slow --skip-simulation
 contract DeployCoins is Script {
     address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
-    uint160 constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG);
+    uint160 constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG);
 
     function run() external {
         require(block.chainid != 1, "no mainnet");
@@ -39,7 +39,7 @@ contract DeployCoins is Script {
         hook.setFactory(address(factory));
         if (airdrop != pot) {
             // bind the AirdropClaim to this factory so only it can start unset-drop clocks (owner must be the deployer)
-            try AirdropClaim(airdrop).setFactory(address(factory)) {} catch { console.log("WARN: AirdropClaim.setFactory failed; the owner must call it"); }
+            AirdropClaim(airdrop).setFactory(address(factory)); // must succeed: an unbound claim would make every launch revert
         }
         vm.stopBroadcast();
 

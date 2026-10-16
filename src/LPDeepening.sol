@@ -87,7 +87,6 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     /// @param minEthOut the least ETH the keeper will accept for the half it sells (off-chain quote minus tolerance)
     function run(uint256 minEthOut) external nonReentrant {
         if (msg.sender != keeper) revert NotKeeper();
-        if (tokenId != 0) _collectFees(); // pay out accrued LP fees first; INCREASE_LIQUIDITY would otherwise lock them (swarm audit 2)
         hook.claim();
         uint256 amount = jig.balanceOf(address(this));
         if (amount == 0) revert Nothing();
@@ -96,6 +95,9 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
         poolManager.unlock(abi.encode(half));
         uint256 ethGot = address(this).balance - ethBefore;
         if (ethGot < minEthOut || ethGot == 0) revert TooLittleOut();
+        // pay out accrued LP fees now, after our own sale has paid the position its share: INCREASE_LIQUIDITY
+        // would otherwise net them into the locked position (swarm audits 2 and 3)
+        if (tokenId != 0) _collectFees();
         uint256 jigLeft = amount - half; // only this run's other half goes in; the rest waits
         uint256 eth = address(this).balance - platformOwedEth; // ETH booked for the team is not working capital
 

@@ -103,6 +103,9 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         if (airdropRecipient_.code.length > 0) {
             (bool ok, bytes memory ret) = airdropRecipient_.staticcall(abi.encodeWithSignature("pot()"));
             if (!ok || ret.length != 32) revert BadAirdropRecipient();
+            // and it must not already be bound to another factory: notify() would revert NotFactory on every launch
+            (bool ok2, bytes memory ret2) = airdropRecipient_.staticcall(abi.encodeWithSignature("factory()"));
+            if (!ok2 || ret2.length != 32 || abi.decode(ret2, (address)) != address(0)) revert BadAirdropRecipient();
         }
         airdropRecipient = airdropRecipient_;
         launchFeeWei = launchFeeWei_;
@@ -116,7 +119,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
     }
 
     function launch(LaunchParams calldata p) external payable nonReentrant returns (uint256 index, address coinAddr) {
-        if (msg.value != launchFeeWei) revert WrongFee();
+        if (msg.value < launchFeeWei) revert WrongFee(); // a fee update landing before a quoted launch must not revert it; excess is refunded
         if (p.collection == address(0) || p.collection.code.length == 0) revert ZeroAddress();
         if (p.creatorBps > MAX_CREATOR_BPS) revert TooMuchCreator();
         if (coinOf[p.collection] != address(0)) revert CollectionHasCoin();
@@ -146,6 +149,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
         uint256 creatorTokens = (SUPPLY * p.creatorBps) / 10_000;
         uint256 tokenId = _seed(coin, key, coinIs0, SUPPLY - AIRDROP_SHARE - creatorTokens, p.tickLower, p.tickUpper);
+        hook.seal(key); // the factory's position is the only liquidity this pool will ever have
 
         if (creatorTokens > 0) IERC20(coinAddr).safeTransfer(msg.sender, creatorTokens);
         IERC20(coinAddr).safeTransfer(airdropRecipient, AIRDROP_SHARE);
@@ -157,8 +161,12 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         index = launches.length;
         launches.push(Launch({coin: coinAddr, collection: p.collection, creator: msg.sender, tokenId: tokenId, key: key}));
 
-        (bool ok,) = platform.call{value: msg.value}("");
+        (bool ok,) = platform.call{value: launchFeeWei}("");
         if (!ok) revert FeeSendFailed();
+        if (msg.value > launchFeeWei) {
+            (bool r,) = msg.sender.call{value: msg.value - launchFeeWei}("");
+            if (!r) revert FeeSendFailed();
+        }
         emit CoinLaunched(index, coinAddr, p.collection, msg.sender, p.feePips, p.flywheel, tokenId, creatorTokens, p.devBuyJig, devBuyCoin);
     }
 

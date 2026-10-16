@@ -27,7 +27,7 @@ import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProo
 ///     spacing and start price, and only JIGLaunch may initialise it. Nobody can open
 ///     the pool early to start the window or consume the hook.
 ///
-/// Address must carry exactly BEFORE_INITIALIZE_FLAG | BEFORE_SWAP_FLAG (0x2080) in
+/// Address must carry exactly BEFORE_INITIALIZE_FLAG | BEFORE_ADD_LIQUIDITY_FLAG | BEFORE_SWAP_FLAG (0x2880) in
 /// its low 14 bits; the deploy script mines a CREATE2 salt for that.
 contract JIGLaunchHook is IHooks {
     using LPFeeLibrary for uint24;

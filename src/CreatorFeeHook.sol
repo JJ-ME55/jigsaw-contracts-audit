@@ -40,7 +40,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///   linearly from SNIPE_FEE (60%) down to the chosen fee.
 ///
 /// Address must carry exactly BEFORE_INITIALIZE | AFTER_SWAP | AFTER_SWAP_RETURNS_DELTA
-/// (0x2044) in its low 14 bits.
+/// (0x2844) in its low 14 bits.
 contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     using PoolIdLibrary for PoolKey;
     using SafeERC20 for IERC20;
@@ -59,6 +59,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         uint64 launchedAt;
         bool coinIs0;
         bool registered;
+        bool seeded; // true once the factory has seeded: no other liquidity, ever (swarm audit 3)
     }
 
     uint24 public constant MIN_FEE = 10_000;
@@ -84,7 +85,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     mapping(address => uint256) public claimable; // JIG owed, by recipient
     // Per-pool recycle ledger: what creator/flywheel earned on this pool since their last full claim.
     // claimEpoch bumps on every claim/claimFor; entries from an older epoch count as zero.
-    struct Earned { uint128 amount; uint64 epoch; uint64 lastCredit; }
+    struct Earned { uint128 amount; uint64 epoch; uint64 lastCredit; uint64 firstCredit; } // firstCredit: when the current unclaimed balance started
     mapping(PoolId => mapping(address => Earned)) public earned;
     mapping(address => uint64) public claimEpoch;
     uint16 public constant DEFAULT_SHARE = type(uint16).max; // register sentinel: default split
@@ -115,6 +116,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     error NotStale();
     error BadFlywheel();
     error HookNotImplemented();
+    error LiquidityLocked();
     error ExactOutputSell();
 
     constructor(address poolManager_, address jig_, address owner_, address platform_, address pot_) {
@@ -131,7 +133,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -195,7 +197,8 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
             tickUpper: tickUpper,
             launchedAt: uint64(block.timestamp),
             coinIs0: coinIs0,
-            registered: true
+            registered: true,
+            seeded: false
         });
         emit PoolRegistered(id, coinIs0 ? c0 : c1, creator, feePips, flywheel, creatorBps);
     }
@@ -247,6 +250,15 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     ///         Anyone may call. Only this pool's creator or flywheel is recyclable, only for what they earned here,
     ///         and the creator+flywheel block goes to the other side (creator's stale money feeds the flywheel,
     ///         the flywheel's stale money feeds the pot), so recycling can never pay the party that let it go stale.
+    /// @notice The factory calls this once its seed position is minted. From then on the pool accepts no liquidity
+    ///         from anyone: an LP band inside the range would trade coin for JIG at spot with no fee and no anti-snipe.
+    function seal(PoolKey calldata key) external {
+        if (msg.sender != factory) revert NotFactory();
+        Config storage c = pools[key.toId()];
+        if (!c.registered) revert NotRegistered();
+        c.seeded = true;
+    }
+
     function recycle(PoolKey calldata key, address from) external nonReentrant returns (uint256 amount) {
         PoolId id = key.toId();
         Config storage c = pools[id];
@@ -255,7 +267,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         if (from != c.creator && from != fly) revert NotStale();
         Earned storage e = earned[id][from];
         if (e.epoch != claimEpoch[from] || e.amount == 0) revert NotStale();
-        if (block.timestamp < e.lastCredit + RECYCLE_AFTER) revert NotStale();
+        if (block.timestamp < e.firstCredit + RECYCLE_AFTER) revert NotStale(); // from the first unclaimed credit, so a dust buy cannot reset the clock
         amount = e.amount;
         if (amount > claimable[from]) amount = claimable[from];
         e.amount = 0;
@@ -412,6 +424,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         _credit(to, amount);
         Earned storage e = earned[id][to];
         if (e.epoch != claimEpoch[to]) { e.epoch = claimEpoch[to]; e.amount = 0; }
+        if (e.amount == 0) e.firstCredit = uint64(block.timestamp);
         e.amount += uint128(amount);
         e.lastCredit = uint64(block.timestamp);
     }
@@ -430,8 +443,11 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         revert HookNotImplemented();
     }
 
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata) external pure override returns (bytes4) {
-        revert HookNotImplemented();
+    function beforeAddLiquidity(address, PoolKey calldata key, ModifyLiquidityParams calldata, bytes calldata) external view override returns (bytes4) {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        Config storage c = pools[key.toId()];
+        if (!c.registered || c.seeded) revert LiquidityLocked();
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata)

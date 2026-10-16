@@ -9,9 +9,9 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 /// @notice Linear vesting with an optional cliff, for any ERC-20. Anyone can fund a
 ///         schedule for anyone. Nothing is revocable: once funded, only the
 ///         beneficiary can ever receive the tokens, and only on the schedule.
-///         Used by the coin factory for creator allocations (5%, 6 months) and for
-///         anything else that must be provably locked. JIG itself has no team
-///         allocation (spec 2).
+///         Deployed but unused: creator vesting was dropped on 15 Oct (the factory pays
+///         the creator's 0-5% straight to their wallet). Kept for anything that must
+///         be provably locked later. JIG itself has no team allocation (spec 2).
 contract Vesting is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
