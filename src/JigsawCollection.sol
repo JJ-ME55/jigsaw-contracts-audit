@@ -11,6 +11,10 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
+interface Ownable2StepLike {
+    function owner() external view returns (address);
+}
+
 /// @title JigsawCollection
 /// @notice ERC-721 logic for EIP-1167 clones, made by JigsawCollectionFactory. The same contract as the Loom collection
 ///         (fee split, provenance, placeholder, reveal seed, freeze, pause, royalties, 1% reserve mint) plus timed mint
@@ -54,6 +58,7 @@ contract JigsawCollection is
         uint96 royaltyBps;
     }
 
+    address public factory; // the JigsawCollectionFactory that made this clone; its owner (the Safe) can recover it
     address public creator;
     uint256 public maxSupply;
     uint256 public maxPerWallet;
@@ -97,6 +102,7 @@ contract JigsawCollection is
     error BadProvenance();
     error NothingToFreeze();
     error CannotRenounce();
+    error NotFactoryOwner();
 
     event Minted(address indexed minter, uint256 indexed firstTokenId, uint256 quantity);
     event PhaseMinted(address indexed minter, uint256 indexed phase, uint256 quantity);
@@ -137,6 +143,7 @@ contract JigsawCollection is
         if (c.royaltyBps > MAX_ROYALTY_BPS) revert RoyaltyTooHigh();
         if (provenance == bytes32(0)) revert BadProvenance();
         if (freeze && revealLater) revert NothingToFreeze(); // the reveal freezes a reveal-later collection
+        if (freeze && bytes(uri).length == 0) revert NothingToFreeze(); // as freezeMetadata(): never frozen on no metadata (swarm round 8, Low 3)
 
         __ERC721_init(c.name, c.symbol);
         __Ownable_init(owner_);
@@ -144,6 +151,7 @@ contract JigsawCollection is
         __Pausable_init();
         __ReentrancyGuard_init();
 
+        factory = msg.sender;
         creator = c.creator;
         maxSupply = c.maxSupply;
         maxPerWallet = c.maxPerWallet;
@@ -286,6 +294,14 @@ contract JigsawCollection is
         if (quantity > maxSupply / RESERVE_SUPPLY_DENOMINATOR - reserveMinted) revert ReserveCapExceeded();
         reserveMinted += quantity;
         _mintAndDistribute(msg.sender, quantity, price, true);
+    }
+
+    /// @notice The factory's owner (the Safe) hands the collection to a new owner, for when the operator key is lost
+    ///         or leaked (swarm round 8, Low 5; as CollectionLauncher.reoffer on the Loom path).
+    function recoverOwnership(address newOwner) external {
+        if (msg.sender != Ownable2StepLike(factory).owner()) revert NotFactoryOwner();
+        if (newOwner == address(0)) revert ZeroAddress();
+        _transferOwnership(newOwner);
     }
 
     /// @dev Renouncing would strand a paused or unrevealed collection; ownership moves only by transfer (to the Safe).

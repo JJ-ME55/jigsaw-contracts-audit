@@ -70,8 +70,10 @@ export async function airdropFor(coin, account) {
   // delivery status for the whole collection's pending shares (what the keeper still has to push)
   let delivery = null;
   try { const pa = await pushableIds(coin); delivery = open ? await pushStatus(coin, collection, pa.ids.length) : { status: 'closed' }; } catch (e) { delivery = { status: 'unknown', reason: e.shortMessage ?? e.message }; }
+  // a contract wallet (Safe, smart account) is never pushed to (round 8, Medium 2): it claims with the button
+  const selfClaim = ((await p.getCode({ address: account }).catch(() => '0x')) ?? '0x') !== '0x';
   return {
-    coin, collection, open, delivery, opensAt: Number(opensAt), closesAt, perNft: perNft.toString(), maxId: Number(maxId),
+    coin, collection, open, delivery, selfClaim, opensAt: Number(opensAt), closesAt, perNft: perNft.toString(), maxId: Number(maxId),
     ids, alreadyClaimed: mine.filter((_, k) => claimed[k]), amount: (perNft * BigInt(ids.length)).toString(),
     claim: open && ids.length ? { to: a.airdrop, data: encodeFunctionData({ abi: airdropAbi, functionName: 'claim', args: [coin, ids.map(BigInt)] }) } : null,
   };
@@ -90,7 +92,12 @@ export async function pushableIds(coin) {
   const owners = await ownersOf(p, collection, maxId);
   const minted = []; for (let id = 1; id < owners.length; id++) if (owners[id] && owners[id] !== getAddress('0x000000000000000000000000000000000000dEaD')) minted.push(id);
   const claimed = minted.length ? await p.multicall({ multicallAddress: MULTICALL3, allowFailure: false, contracts: minted.map((id) => ({ address: a.airdrop, abi: airdropAbi, functionName: 'claimed', args: [coin, BigInt(id)] })) }) : [];
-  return { open: true, collection, ids: minted.filter((_, k) => !claimed[k]), complete: owners.length - 1 >= Number(maxId), airdrop: a.airdrop };
+  const open = minted.filter((_, k) => !claimed[k]);
+  // claimFor skips NFTs held by a contract (escrow, vault, smart wallet: swarm round 8, Medium 2); their owners claim
+  // themselves, so the keeper never queues them (it would send the same batch again and again)
+  const code = new Map();
+  for (const o of new Set(open.map((id) => owners[id]))) code.set(o, ((await p.getCode({ address: o }).catch(() => '0x')) ?? '0x') !== '0x');
+  return { open: true, collection, ids: open.filter((id) => !code.get(owners[id])), contractHeld: open.filter((id) => code.get(owners[id])), complete: owners.length - 1 >= Number(maxId), airdrop: a.airdrop };
 }
 
 // ---------------- what the platform has earned from one coin (for the airdrop push gate) ----------------

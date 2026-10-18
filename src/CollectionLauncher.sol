@@ -48,6 +48,7 @@ contract CollectionLauncher {
     error NotOperator();
     error NotAdmin();
     error BadProvenance();
+    error NothingToFreeze();
 
     constructor(address factory_, address operator_, address admin_) {
         if (factory_ == address(0) || operator_ == address(0) || admin_ == address(0)) revert ZeroAddress();
@@ -68,6 +69,7 @@ contract CollectionLauncher {
     {
         if (msg.sender != operator) revert NotOperator();
         if (provenance == bytes32(0)) revert BadProvenance(); // LoomCollection would treat a zero hash as committed forever
+        if (freeze && revealLater) revert NothingToFreeze(); // the reveal freezes it; as JigsawCollection (swarm round 8, Info 7)
         collection = factory.createCollection{value: msg.value}(
             c.name, c.symbol, c.maxSupply, c.mintPriceWei, c.maxPerWallet, c.creator, c.royaltyBps
         );

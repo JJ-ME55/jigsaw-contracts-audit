@@ -107,6 +107,9 @@ contract AirdropClaim is Ownable2Step, ReentrancyGuard {
             if (!ok || ret.length != 32) continue; // not minted
             address owner_ = abi.decode(ret, (address));
             if (owner_ == address(0) || owner_ == DEAD) continue;
+            // never push into a contract (escrow, vault, bridge, smart wallet): it may not be able to move the coin,
+            // and the id would be marked claimed for good. Those owners claim themselves (swarm round 8, Medium 2)
+            if (owner_.code.length != 0) continue;
             claimed[coin][id] = true;
             IERC20(coin).safeTransfer(owner_, d.perNft);
             pushed++;

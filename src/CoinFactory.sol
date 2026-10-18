@@ -19,6 +19,10 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {CreatorCoin} from "./CreatorCoin.sol";
 import {CreatorFeeHook} from "./CreatorFeeHook.sol";
 
+interface IAirdropPot {
+    function pot() external view returns (address);
+}
+
 interface IAirdropNotify {
     function notify(address coin) external;
 }
@@ -239,10 +243,12 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
     /// @dev Protocol addresses that hold coin but are not holders: no share of holder rewards (CreatorCoin).
     function _excluded() internal view returns (address[] memory e) {
-        e = new address[](3);
+        e = new address[](4);
         e[0] = address(poolManager);
         e[1] = address(hook);
         e[2] = airdropRecipient;
+        // the pot receives every swept airdrop remainder and has no way to call claim() (swarm round 8, High 1)
+        e[3] = IAirdropPot(airdropRecipient).pot();
     }
 
     function count() external view returns (uint256) {

@@ -12,7 +12,7 @@ import {CreatorCoin} from "./CreatorCoin.sol";
 /// @notice Flywheel module for "fees to coin holders": one per collection, its address is the `flywheel` passed to
 ///         CoinFactory (which makes it the coin's reward notifier). pull() claims the coin's flywheel slice from the
 ///         hook and hands it to the coin, which streams it to holders on chain (CreatorCoin). No key and no
-///         snapshot: anyone may call pull() (once a day), and because rewards stream over seven days, choosing when
+///         snapshot: anyone may call pull() (once a day), and because rewards stream over one day (CreatorCoin.DURATION), choosing when
 ///         to pull gains nobody anything. Replaces SnapshotForwarder + HolderPayouts (Jj, 17 Oct).
 contract RewardsForwarder is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -21,7 +21,7 @@ contract RewardsForwarder is ReentrancyGuard {
     IERC20 public immutable jig;
     CoinFactory public immutable factory;
     address public immutable collection;
-    uint64 public constant MIN_INTERVAL = 1 days; // each pull restarts the coin's 7-day stream for what is left
+    uint64 public constant MIN_INTERVAL = 1 days; // == CreatorCoin.DURATION: the previous stream has ended when the next pull is allowed
     uint64 public lastPull;
 
     event Forwarded(uint256 amount);
@@ -50,8 +50,10 @@ contract RewardsForwarder is ReentrancyGuard {
         return lastPull == 0 ? 0 : uint256(lastPull) + MIN_INTERVAL;
     }
 
-    /// @notice Anyone may call, at most once a day: every pull restarts the coin's 7-day stream for what is still
-    ///         streaming, so pulling after every trade could otherwise keep stretching holders' payouts (review, 17 Oct).
+    /// @notice Anyone may call, at most once a day. The coin streams each pull over CreatorCoin.DURATION (1 day) and
+    ///         MIN_INTERVAL equals it, so the previous stream has always ended when the next pull is allowed: nothing is
+    ///         ever re-spread or stretched (review 17 Oct; round 8, Info 8). With no new JIG, a pull still re-streams the
+    ///         coin's carry (reward streamed while nobody was eligible) so it reaches later holders (round 8, Info 10).
     function pull() external nonReentrant returns (uint256 amount) {
         if (lastPull != 0 && block.timestamp < uint256(lastPull) + MIN_INTERVAL) revert TooSoon();
         lastPull = uint64(block.timestamp);
@@ -61,6 +63,9 @@ contract RewardsForwarder is ReentrancyGuard {
             CreatorCoin c = rewardsCoin();
             jig.forceApprove(address(c), amount);
             c.notifyReward(amount);
+        } else {
+            address a = factory.coinOf(collection);
+            if (a != address(0) && CreatorCoin(a).carry() > 0 && !CreatorCoin(a).rewardsPaused()) CreatorCoin(a).notifyReward(0);
         }
         emit Forwarded(amount);
     }
