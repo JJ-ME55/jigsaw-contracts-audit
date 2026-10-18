@@ -7,8 +7,8 @@
 //      sha256 over the image hashes in id order). The base URI is NOT set: every token shows the unrevealed
 //      placeholder (its cover is art #1; which token gets which art is unknown until the seed exists).
 //   2. When minting sells out, or the creator's timer passes, the reveal is triggered; an early reveal pauses the mint
-//      first. The seed is the drand randomness of the first round published after the later of the trigger and the
-//      block that confirmed the pause (randomness.mjs), so anyone can check which round was due. It is recorded on the
+//      first. The seed is the drand randomness of the first round published after the block where minting ended (the
+//      pause, or the mint of the last token; recorded as mintEnded.anchor), so anyone can check which round was due. It is recorded on the
 //      contract with setRevealSeed.
 //   3. perm = fisherYates(N, seed) (below, keccak-driven, documented in reveal.json next to the metadata). Token id t
 //      gets art index perm[t]. The revealed metadata directory is pinned and becomes the base URI. If the launch asked
@@ -16,10 +16,10 @@
 // Anyone can recompute perm from the seed and compare each token's art hash against the provenance order.
 import fs from 'node:fs';
 import path from 'node:path';
-import { keccak256, encodePacked, createPublicClient, http } from 'viem';
+import { keccak256, encodePacked, createPublicClient, http, parseAbi } from 'viem';
 import { load, update, buildDir, list, ledger } from './store.mjs';
 import { pinFolder } from './pin.mjs';
-import { configureClone, readSupply, endMint, webBase, IPFS_GATEWAY, CHAINS } from './launch.mjs';
+import { configureClone, readSupply, endMint, webBase, IPFS_GATEWAY, CHAINS, finalBase } from './launch.mjs';
 import { seedFor } from './randomness.mjs';
 
 const MAX_ATTEMPTS = 5;
@@ -62,6 +62,23 @@ export function writeRevealed(out, perm, { name, seedInfo, provenance }) {
 
 export function revealState(b) { return b?.launch?.reveal ?? null; }
 
+const endAbi = parseAbi(['event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)', 'event Paused(address account)']);
+/** The block at which minting ended: { block, unix, source }. Scans back in chunks for the last-token mint or the pause. */
+export async function mintEndAnchor(chainId, collection, { pauseTx, soldOut, maxSupply }) {
+  const c = CHAINS[Number(chainId)]; const p = createPublicClient({ chain: c.chain, transport: http(c.rpc) });
+  const at = async (blockNumber, source) => ({ block: blockNumber.toString(), unix: Number((await p.getBlock({ blockNumber })).timestamp), source });
+  if (pauseTx) return at((await p.getTransactionReceipt({ hash: pauseTx })).blockNumber, `pause tx ${pauseTx}`);
+  const head = await p.getBlockNumber(); const STEP = 10_000n;
+  for (let i = 0n, hi = head; i < 2_000n && hi > 0n; i++, hi = hi > STEP ? hi - STEP : 0n) {
+    const lo = hi > STEP ? hi - STEP + 1n : 0n;
+    const logs = soldOut
+      ? await p.getLogs({ address: collection, event: endAbi[0], args: { from: '0x0000000000000000000000000000000000000000', tokenId: BigInt(maxSupply) }, fromBlock: lo, toBlock: hi })
+      : await p.getLogs({ address: collection, event: endAbi[1], fromBlock: lo, toBlock: hi });
+    if (logs.length) return at(logs[logs.length - 1].blockNumber, soldOut ? `mint of token ${maxSupply}` : 'earlier pause');
+  }
+  throw new Error('could not find the block where minting ended; reveal not seeded');
+}
+
 /** Launch settings -> the reveal plan stored on the build, or null when the launch reveals immediately. */
 export function planFromSettings(s) {
   if (!s?.reveal?.enabled) return null;
@@ -95,9 +112,10 @@ async function run(id) {
       // the seed must be a round published after minting stopped: the trigger time moves to the block that confirmed
       // the pause (checkable on chain; the server clock if the pause was already in place), so nobody can know the
       // token-to-art map while a mint is still possible. Persisted, so a retry keeps it.
-      let pausedUnix = Math.floor(Date.now() / 1000);
-      if (tx) { const c = CHAINS[Number(s.chainId)]; const p = createPublicClient({ chain: c.chain, transport: http(c.rpc) }); const rc = await p.getTransactionReceipt({ hash: tx }); pausedUnix = Number((await p.getBlock({ blockNumber: rc.blockNumber })).timestamp); }
-      setR({ mintEnded: { at: new Date().toISOString(), soldOut: totalSupply >= maxSupply, minted: totalSupply.toString(), pauseTx: tx, pausedUnix }, trigger: { ...r.trigger, unix: Math.max(r.trigger.unix, pausedUnix), seededAfterMintEnded: true } });
+      // The anchor is always a block, never the server clock (final audit, 17 Oct): the pause we just sent, else the
+      // mint of the last token (sold out), else the pause someone made earlier. Recorded so anyone can recompute the round.
+      const anchor = await mintEndAnchor(s.chainId, L.collection, { pauseTx: tx, soldOut: totalSupply >= maxSupply, maxSupply });
+      setR({ mintEnded: { at: new Date().toISOString(), soldOut: totalSupply >= maxSupply, minted: totalSupply.toString(), pauseTx: tx, pausedUnix: anchor.unix, anchor }, trigger: { ...r.trigger, unix: anchor.unix, seededAfterMintEnded: true } });
       b = load(id);
     }
     // 1. seed: drand round after the trigger (moved to the end of minting above); fixed, so a retry gets the same one
@@ -121,9 +139,11 @@ async function run(id) {
     }
     // 3. on chain: seed, base URI, freeze
     setR({ state: 'configuring' });
-    const txs = await configureClone(s.chainId, L.collection, { revealSeed: seedInfo.seed, baseURI: pinned.baseURI, freeze: r.freeze });
-    update(id, (d) => { d.launch.reveal = { ...d.launch.reveal, state: 'done', txs, finishedAt: new Date().toISOString() }; d.launch.baseURI = pinned.baseURI; d.launch.revealed = true; });
-    ledger(`${id},reveal,${L.collection},${s.chainId},${pinned.baseURI},${seedInfo.source}:${seedInfo.round}`);
+    const base = finalBase(s.chainId, pinned);
+    const mainnet = [1, 4663].includes(Number(s.chainId));
+    const txs = await configureClone(s.chainId, L.collection, { revealSeed: seedInfo.seed, baseURI: base, freeze: mainnet || r.freeze });
+    update(id, (d) => { d.launch.reveal = { ...d.launch.reveal, state: 'done', txs, finishedAt: new Date().toISOString() }; d.launch.baseURI = base; d.launch.revealed = true; });
+    ledger(`${id},reveal,${L.collection},${s.chainId},${base},${seedInfo.source}:${seedInfo.round}`);
   } catch (e) {
     setR({ state: 'failed', error: e.message });
   }

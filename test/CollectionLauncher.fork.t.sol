@@ -37,7 +37,7 @@ contract CollectionLauncherForkTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envOr("SEPOLIA_RPC", string("https://ethereum-sepolia-rpc.publicnode.com")));
-        launcher = new CollectionLauncher(FACTORY, op);
+        launcher = new CollectionLauncher(FACTORY, op, makeAddr("safe"));
         vm.deal(op, 10 ether);
         vm.deal(minter, 10 ether);
     }
@@ -66,7 +66,7 @@ contract CollectionLauncherForkTest is Test {
     function test_launcher_commits_before_any_mint_and_hands_ownership_to_the_operator() public {
         uint256 fee = IFactoryView(FACTORY).CREATE_FEE();
         vm.prank(op);
-        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://placeholder.json", true);
+        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://placeholder.json", true, false);
         assertTrue(ICollectionView(col).provenanceSet(), "provenance committed in the creating transaction");
         assertEq(ICollectionView(col).provenanceHash(), keccak256("art"));
         assertEq(ICollectionView(col).unrevealedURI(), "ipfs://placeholder.json");
@@ -82,9 +82,18 @@ contract CollectionLauncherForkTest is Test {
     function test_launcher_sets_the_base_uri_for_an_immediate_reveal() public {
         uint256 fee = IFactoryView(FACTORY).CREATE_FEE();
         vm.prank(op);
-        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://meta/", false);
+        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://meta/", false, false);
         assertEq(ICollectionView(col).baseURI(), "ipfs://meta/");
         assertTrue(ICollectionView(col).provenanceSet());
+    }
+
+    function test_an_immediate_reveal_can_be_frozen_at_creation() public {
+        uint256 fee = IFactoryView(FACTORY).CREATE_FEE();
+        vm.prank(op);
+        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://meta/", false, true);
+        (bool ok, bytes memory ret) = col.staticcall(abi.encodeWithSignature("metadataFrozen()"));
+        assertTrue(ok && abi.decode(ret, (bool)), "frozen in the creating transaction");
+        assertEq(ICollectionView(col).baseURI(), "ipfs://meta/");
     }
 
     function test_only_the_operator_can_launch() public {
@@ -92,6 +101,51 @@ contract CollectionLauncherForkTest is Test {
         vm.deal(minter, 10 ether);
         vm.prank(minter);
         vm.expectRevert(CollectionLauncher.NotOperator.selector);
-        launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://x/", false);
+        launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://x/", false, false);
+    }
+}
+
+/// Final audit (17 Oct): Info 19, a zero provenance is refused; Low 7, a collection whose pending owner cannot accept
+/// (operator key rotated or lost) can be re-offered by the admin (the Safe), and by nobody else.
+contract CollectionLauncherAdminForkTest is Test {
+    address constant FACTORY = 0xbE4d0c08C60bB459e8bF19a4524eB6dCBD87F50F;
+    address op = makeAddr("operator");
+    address safe = makeAddr("safe");
+    address op2 = makeAddr("operator2");
+    CollectionLauncher launcher;
+
+    function setUp() public {
+        vm.createSelectFork(vm.envOr("SEPOLIA_RPC", string("https://ethereum-sepolia-rpc.publicnode.com")));
+        launcher = new CollectionLauncher(FACTORY, op, safe);
+        vm.deal(op, 10 ether);
+    }
+
+    function _c() internal returns (CollectionLauncher.Collection memory) {
+        return CollectionLauncher.Collection("Admin Test", "ADM", 100, 0, 5, makeAddr("creator"), 500);
+    }
+
+    function test_zero_provenance_is_refused() public {
+        uint256 fee = IFactoryView(FACTORY).CREATE_FEE();
+        vm.prank(op);
+        vm.expectRevert(CollectionLauncher.BadProvenance.selector);
+        launcher.create{value: fee}(_c(), bytes32(0), "ipfs://x/", false, false);
+    }
+
+    function test_admin_reoffers_a_stranded_collection_and_nobody_else_can() public {
+        uint256 fee = IFactoryView(FACTORY).CREATE_FEE();
+        vm.prank(op);
+        address col = launcher.create{value: fee}(_c(), keccak256("art"), "ipfs://p.json", true, false);
+        vm.prank(op2);
+        vm.expectRevert(CollectionLauncher.NotAdmin.selector);
+        launcher.reoffer(col, op2);
+        vm.prank(op);
+        vm.expectRevert(CollectionLauncher.NotAdmin.selector);
+        launcher.reoffer(col, op2);
+        vm.prank(safe);
+        launcher.reoffer(col, op2);
+        assertEq(ICollectionView(col).pendingOwner(), op2);
+        vm.prank(op2);
+        ICollectionView(col).acceptOwnership();
+        assertEq(ICollectionView(col).owner(), op2);
     }
 }

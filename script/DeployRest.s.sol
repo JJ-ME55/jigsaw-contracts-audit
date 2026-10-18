@@ -18,8 +18,8 @@ contract DeployRest is Script {
         uint256 pk = vm.envUint("LAUNCH_PK");
         address deployer = vm.addr(pk);
         address pot = vm.envAddress("POT");
-        // Owned by the deployer at first: DeployCoins (same key) must call setFactory on it, then hands ownership to
-        // AIRDROP_OWNER (the operating wallet, which writes the drop roots): transferOwnership + acceptOwnership.
+        // Owned by the deployer only until DeployCoins (same key) calls setFactory, then renounced: the per-NFT airdrop
+        // has no owner powers (17 Oct).
         vm.startBroadcast(pk);
         AirdropClaim airdrop = new AirdropClaim(deployer, pot);
         vm.stopBroadcast();

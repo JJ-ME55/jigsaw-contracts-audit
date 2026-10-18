@@ -30,11 +30,11 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///   Fee split, in basis points of the fee: pot 300 and deepening 200 fixed; platform by
 ///   band (1% -> 2500, 2-3% -> 3000, 4-6% -> 3500, 7-10% -> 4000); the rest is the
 ///   creator+flywheel block (7000 / 6500 / 6000 / 5500), which the creator divides as they
-///   like (default: flywheel 2000, creator the remainder). A creator's or flywheel's
-///   earnings on a pool that sit unclaimed for RECYCLE_AFTER are folded back through the
-///   split by anyone, with the creator+flywheel block going to the other side: a stale
-///   creator balance feeds the flywheel, a stale flywheel balance feeds the pot. Recycling
-///   is accounted per pool, so nobody can touch what an address earned elsewhere.
+///   like (default: flywheel 2000, creator the remainder). A creator's earnings on a pool
+///   that sit unclaimed for RECYCLE_AFTER are folded back through the split by anyone, the
+///   creator+flywheel block going to the flywheel. A flywheel module's slice never expires
+///   (17 Oct): anyone can pull it, so an outage cannot move holders' money. Recycling is
+///   accounted per pool, so nobody can touch what an address earned elsewhere.
 ///
 ///   Anti-snipe: for SNIPE_WINDOW (seconds, pump-style) after launch the fee decays
 ///   linearly from SNIPE_FEE (60%) down to the chosen fee.
@@ -260,15 +260,16 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Fold what `from` earned on this pool and left unclaimed for RECYCLE_AFTER back through the split.
-    ///         Anyone may call. Only this pool's creator or flywheel is recyclable, only for what they earned here,
-    ///         and the creator+flywheel block goes to the other side (creator's stale money feeds the flywheel,
-    ///         the flywheel's stale money feeds the pot), so recycling can never pay the party that let it go stale.
+    ///         Anyone may call. Only the creator's share is recyclable, only for what they earned here: their stale
+    ///         block feeds the flywheel (or the pot when the creator is the flywheel). A flywheel module's slice never
+    ///         expires: it belongs to holders or to its burn and anyone can pull it, so an outage cannot redirect it
+    ///         (review, 17 Oct). With no module (flywheel = 0) the creator is the flywheel and stays recyclable.
     function recycle(PoolKey calldata key, address from) external nonReentrant returns (uint256 amount) {
         PoolId id = key.toId();
         Config storage c = pools[id];
         if (!c.registered) revert NotRegistered();
         address fly = c.flywheel == address(0) ? c.creator : c.flywheel;
-        if (from != c.creator && from != fly) revert NotStale();
+        if (from != c.creator) revert NotStale(); // a flywheel module's slice never recycles (17 Oct)
         Earned storage e = earned[id][from];
         if (e.epoch != claimEpoch[from]) revert NotStale();
         (bool any, uint64 cutoff) = _staleCutoff();
@@ -312,6 +313,7 @@ contract CreatorFeeHook is IHooks, IUnlockCallback, ReentrancyGuard {
         Earned storage e = earned[key.toId()][who];
         if (e.epoch != claimEpoch[who]) return (0, 0);
         (bool any, uint64 cutoff) = _staleCutoff();
+        if (who != pools[key.toId()].creator) any = false; // only the creator's share can go stale (17 Oct)
         for (uint256 i = e.head; i < e.chunks.length; i++) {
             if (any && e.chunks[i].day <= cutoff) stale += e.chunks[i].amount;
             else fresh += e.chunks[i].amount;

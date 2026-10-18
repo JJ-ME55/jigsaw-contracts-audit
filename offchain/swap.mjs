@@ -81,12 +81,14 @@ const pathOf = (r, hookData = '0x') => r.hops.map((h, i) => {
 
 /** Output for `amountIn` from the V4 Quoter (eth_call; the quoter reverts internally by design). Net of every pool and
  *  hook fee on the route (the quoter runs the hooks); "gross" only of the platform's TAKE_PORTION, applied after. */
-export async function quoteGross(r, amountIn, hookData = '0x') {
+// `account` is the sender: eth_call then runs with tx.origin = that wallet, which is what JIGLaunchHook's allowlist
+// checks (without it an allowlisted wallet was quoted the 60% window fee, final audit 17 Oct)
+export async function quoteGross(r, amountIn, hookData = '0x', account) {
   const { v, pub } = ctx();
   const data = r.hops.length === 1
     ? encodeFunctionData({ abi: quoterAbi, functionName: 'quoteExactInputSingle', args: [{ poolKey: r.hops[0].key, zeroForOne: r.hops[0].zeroForOne, exactAmount: amountIn, hookData }] })
     : encodeFunctionData({ abi: quoterAbi, functionName: 'quoteExactInput', args: [{ exactCurrency: r.from, path: pathOf(r, hookData), exactAmount: amountIn }] });
-  const res = await pub.call({ to: v.quoter, data });
+  const res = await pub.call({ to: v.quoter, data, ...(account && isAddress(account) ? { account: getAddress(account) } : {}) });
   const [out] = decodeFunctionResult({ abi: quoterAbi, functionName: r.hops.length === 1 ? 'quoteExactInputSingle' : 'quoteExactInput', data: res.data });
   return out;
 }
@@ -116,7 +118,7 @@ export async function quote({ from, to, amountIn, slippageBps = 100, account, ho
   const amt = BigInt(amountIn); if (amt <= 0n) throw new Error('amountIn must be positive');
   const slip = Math.min(5000, Math.max(0, Number(slippageBps)));
   const r = await route(from, to);
-  const gross = await quoteGross(r, amt, hookData);
+  const gross = await quoteGross(r, amt, hookData, account);
   const bps = feeBps(); const platform = process.env.PLATFORM_ADDRESS && isAddress(process.env.PLATFORM_ADDRESS) ? getAddress(process.env.PLATFORM_ADDRESS) : null;
   const effBps = platform ? bps : 0;
   const fee = (gross * BigInt(effBps)) / 10_000n; const net = gross - fee;

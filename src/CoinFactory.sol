@@ -132,9 +132,10 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         // the collection's creator can launch for it. The vanity ending is ground off chain; the contract does not check it.
         if (bytes20(p.salt) != bytes20(p.collection)) revert BadSalt();
 
-        CreatorCoin coin = new CreatorCoin{salt: p.salt}(p.name, p.symbol, SUPPLY, p.collection, address(this));
+        CreatorCoin coin = new CreatorCoin{salt: p.salt}(p.name, p.symbol, SUPPLY, p.collection, address(this), address(jig), _excluded());
         coinAddr = address(coin);
         coinOf[p.collection] = coinAddr;
+        coin.setNotifier(p.flywheel); // the flywheel module streams holder rewards (RewardsForwarder); others never notify
 
         bool coinIs0 = coinAddr < address(jig);
         PoolKey memory key = PoolKey({
@@ -236,6 +237,14 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
         return false;
     }
 
+    /// @dev Protocol addresses that hold coin but are not holders: no share of holder rewards (CreatorCoin).
+    function _excluded() internal view returns (address[] memory e) {
+        e = new address[](3);
+        e[0] = address(poolManager);
+        e[1] = address(hook);
+        e[2] = airdropRecipient;
+    }
+
     function count() external view returns (uint256) {
         return launches.length;
     }
@@ -246,7 +255,7 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
     /// @notice keccak256 of the coin's init code for this collection, name and symbol: what a CREATE2 salt grinder needs.
     function coinInitCodeHash(address collection, string calldata name, string calldata symbol) public view returns (bytes32) {
-        return keccak256(abi.encodePacked(type(CreatorCoin).creationCode, abi.encode(name, symbol, SUPPLY, collection, address(this))));
+        return keccak256(abi.encodePacked(type(CreatorCoin).creationCode, abi.encode(name, symbol, SUPPLY, collection, address(this), address(jig), _excluded())));
     }
 
     /// @notice The address launch() will give the coin for these inputs.

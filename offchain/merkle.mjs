@@ -1,16 +1,16 @@
-// OpenZeppelin-compatible Merkle trees (double-hashed leaves, sorted pairs, odd node carried up), the shape every
-// claim contract here verifies with MerkleProof: JIGLaunchHook (address leaves), HolderPayouts and AirdropClaim
-// (address + amount leaves: keccak256(bytes.concat(keccak256(abi.encode(account, amount))))).
-import { keccak256, encodeAbiParameters, concat, getAddress } from 'viem';
+// Merkle allowlists in the OpenZeppelin shape, shared by JIG's launch allowlist and the collections' phase lists:
+// leaf = keccak256(bytes.concat(keccak256(abi.encode(address)))), pairs hashed in sorted order (MerkleProof), odd node
+// carried up. JIGLaunchHook.isAllowlisted and JigsawCollection.mint verify exactly this.
+import { keccak256, encodeAbiParameters, concat, getAddress, isAddress } from 'viem';
 
+export const leafOf = (address) => keccak256(keccak256(encodeAbiParameters([{ type: 'address' }], [getAddress(address)])));
 export const pair = (a, b) => (a.toLowerCase() < b.toLowerCase() ? keccak256(concat([a, b])) : keccak256(concat([b, a])));
-export const amountLeaf = (account, amount) => keccak256(keccak256(encodeAbiParameters([{ type: 'address' }, { type: 'uint256' }], [getAddress(account), BigInt(amount)])));
 
-/** Tree over leaves (hex). Returns { root, layers }. */
-export function tree(leaves) {
-  const sorted = [...new Set(leaves)].sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
-  if (!sorted.length) return { root: null, layers: [] };
-  const layers = [sorted];
+// never .map(getAddress): the index would be read as a chain id (EIP-1191 checksum), so duplicates survived (internal round, 18 Oct)
+export function buildTree(addresses) {
+  const leaves = [...new Set(addresses.map((a) => getAddress(String(a).toLowerCase())))].map(leafOf).sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
+  if (leaves.length === 0) return { root: null, layers: [] };
+  const layers = [leaves];
   while (layers[layers.length - 1].length > 1) {
     const prev = layers[layers.length - 1]; const next = [];
     for (let i = 0; i < prev.length; i += 2) next.push(i + 1 < prev.length ? pair(prev[i], prev[i + 1]) : prev[i]);
@@ -19,25 +19,25 @@ export function tree(leaves) {
   return { root: layers[layers.length - 1][0], layers };
 }
 
-// `index` (leaf -> position) makes building every proof O(n log n); indexOf per leaf was O(n^2) and froze the server
-// for minutes on a large holder list (replica review, 17 Oct)
-export function proof(layers, leaf, index) {
-  if (!layers.length) return null;
-  let idx = index ? (index.get(leaf) ?? -1) : layers[0].indexOf(leaf); if (idx < 0) return null;
-  const out = [];
-  for (let l = 0; l < layers.length - 1; l++) { const sib = idx ^ 1; if (sib < layers[l].length) out.push(layers[l][sib]); idx = Math.floor(idx / 2); }
-  return out;
+export function proofFor(addresses, address) {
+  if (!isAddress(address)) return { allowlisted: false, proof: [] };
+  const { layers } = buildTree(addresses);
+  if (!layers.length) return { allowlisted: false, proof: [] };
+  let idx = layers[0].indexOf(leafOf(address));
+  if (idx < 0) return { allowlisted: false, proof: [] };
+  const proof = [];
+  for (let l = 0; l < layers.length - 1; l++) {
+    const layer = layers[l]; const sib = idx ^ 1;
+    if (sib < layer.length) proof.push(layer[sib]);
+    idx = Math.floor(idx / 2);
+  }
+  return { allowlisted: true, proof };
 }
 
-export const verify = (root, leaf, prf) => prf.reduce((h, p) => pair(h, p), leaf) === root;
-
-/** { account: amount } -> { root, claims: { account: { amount, proof } } } ready to store and serve. */
-export function amountTree(allocations) {
-  const entries = Object.entries(allocations).filter(([, v]) => BigInt(v) > 0n).map(([k, v]) => [getAddress(k), BigInt(v)]);
-  const leaves = entries.map(([k, v]) => amountLeaf(k, v));
-  const { root, layers } = tree(leaves);
-  const index = new Map((layers[0] ?? []).map((l, i) => [l, i]));
-  const claims = {};
-  for (let i = 0; i < entries.length; i++) { const [k, v] = entries[i]; claims[k] = { amount: v.toString(), proof: proof(layers, leaves[i], index) }; }
-  return { root, total: entries.reduce((s, [, v]) => s + v, 0n).toString(), count: entries.length, claims };
+// Pure-JS check that mirrors MerkleProof.verify, for tests and for the admin view.
+export function verify(root, address, proof) {
+  let h = leafOf(address);
+  for (const p of proof) h = pair(h, p);
+  return h === root;
 }
+

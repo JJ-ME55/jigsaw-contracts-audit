@@ -14,8 +14,7 @@ import {AirdropClaim} from "../src/AirdropClaim.sol";
 import {SweepAndBurn} from "../src/SweepAndBurn.sol";
 import {BuybackAndBurn} from "../src/BuybackAndBurn.sol";
 import {LPDeepening} from "../src/LPDeepening.sol";
-import {HolderPayouts} from "../src/HolderPayouts.sol";
-import {SnapshotForwarder} from "../src/SnapshotForwarder.sol";
+import {RewardsForwarder} from "../src/RewardsForwarder.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
@@ -166,27 +165,46 @@ contract FlywheelsForkTest is Test {
 
     // ---------- AirdropClaim ----------
 
-    function test_airdrop_claim_and_sweep() public {
+    // per-NFT, on chain (Jj, 17 Oct): no root, no key; MockNFT has no maxSupply, so its 5 minted ids share the 5%
+    function test_airdrop_claim_per_nft_and_sweep() public {
         (CreatorCoin coin,,) = _launchCoin(address(0));
         assertEq(coin.balanceOf(address(airdrop)), 50_000_000e18, "5% parked in AirdropClaim");
-        bytes32 la = keccak256(bytes.concat(keccak256(abi.encode(holderA, uint256(30_000_000e18)))));
-        bytes32 lb = keccak256(bytes.concat(keccak256(abi.encode(holderB, uint256(10_000_000e18)))));
-        bytes32 root = la < lb ? keccak256(abi.encodePacked(la, lb)) : keccak256(abi.encodePacked(lb, la));
-        vm.prank(platform);
-        airdrop.setDrop(address(coin), root, 40_000_000e18, uint64(block.timestamp + 30 days));
-        bytes32[] memory pa = new bytes32[](1); pa[0] = lb;
-        airdrop.claim(address(coin), holderA, 30_000_000e18, pa);
-        assertEq(coin.balanceOf(holderA), 30_000_000e18);
-        vm.expectRevert(AirdropClaim.AlreadyClaimed.selector);
-        airdrop.claim(address(coin), holderA, 30_000_000e18, pa);
-        vm.expectRevert(AirdropClaim.NotExpired.selector);
-        airdrop.sweep(address(coin));
+        (, , uint256 perNft, uint256 maxId) = airdrop.drops(address(coin));
+        assertEq(maxId, 5); assertEq(perNft, 10_000_000e18);
+        uint256[] memory a = new uint256[](3); a[0] = 1; a[1] = 2; a[2] = 3;
+        vm.prank(holderA); airdrop.claim(address(coin), a);
+        assertEq(coin.balanceOf(holderA), 30_000_000e18, "one share per NFT held");
+        vm.prank(holderA); vm.expectRevert(AirdropClaim.AlreadyClaimed.selector); airdrop.claim(address(coin), a);
+        uint256[] memory one = new uint256[](1); one[0] = 5; // the seller's, unclaimed
+        vm.prank(holderB); vm.expectRevert(abi.encodeWithSelector(AirdropClaim.NotOwnerOf.selector, 5)); airdrop.claim(address(coin), one);
+        one[0] = 6;
+        vm.prank(holderB); vm.expectRevert(abi.encodeWithSelector(AirdropClaim.BadId.selector, 6)); airdrop.claim(address(coin), one);
+        vm.expectRevert(AirdropClaim.NotExpired.selector); airdrop.sweep(address(coin));
         vm.warp(block.timestamp + 31 days);
+        one[0] = 4;
+        vm.prank(holderB); vm.expectRevert(AirdropClaim.Expired.selector); airdrop.claim(address(coin), one);
         airdrop.sweep(address(coin));
-        assertEq(coin.balanceOf(address(pot)), 20_000_000e18, "unclaimed B share + 10M unassigned to the pot");
-        vm.prank(platform);
-        vm.expectRevert(AirdropClaim.AlreadySet.selector);
-        airdrop.setDrop(address(coin), root, 1, uint64(block.timestamp + 1 days));
+        assertEq(coin.balanceOf(address(pot)), 20_000_000e18, "unclaimed shares (ids 4 and 5) go to the pot");
+    }
+
+    // push airdrop (Jj, 17 Oct): anyone (the keeper) sends each id's share to the NFT's current owner; ids already
+    // claimed, unminted or burned are skipped, so a batch never fails on a race with a manual claim
+    function test_airdrop_push_sends_each_share_to_the_current_owner() public {
+        (CreatorCoin coin,,) = _launchCoin(address(0));
+        uint256[] memory one = new uint256[](1); one[0] = 4;
+        vm.prank(holderB); airdrop.claim(address(coin), one); // holderB claims id 4 by hand first
+        vm.prank(seller); IERC721(address(nft)).transferFrom(seller, address(0xdEaD), 5); // id 5 burned
+        uint256[] memory all = new uint256[](7); for (uint256 i; i < 7; i++) all[i] = i + 1; // 6 and 7 do not exist
+        vm.prank(buyer); uint256 sent = airdrop.claimFor(address(coin), all);
+        assertEq(sent, 30_000_000e18, "ids 1-3 pushed; 4 claimed, 5 burned, 6-7 unminted are skipped");
+        assertEq(coin.balanceOf(holderA), 30_000_000e18, "pushed to the owner, not the caller");
+        assertEq(coin.balanceOf(holderB), 10_000_000e18);
+        assertEq(coin.balanceOf(buyer), 0, "the caller gets nothing");
+        assertEq(airdrop.claimFor(address(coin), all), 0, "a second push sends nothing");
+        vm.warp(block.timestamp + 31 days);
+        vm.expectRevert(AirdropClaim.Expired.selector); airdrop.claimFor(address(coin), all);
+        airdrop.sweep(address(coin));
+        assertEq(coin.balanceOf(address(pot)), 10_000_000e18, "the burned id's share goes to the pot");
     }
 
     // ---------- SweepAndBurn ----------
@@ -284,6 +302,18 @@ contract FlywheelsForkTest is Test {
 
     // ---------- LPDeepening ----------
 
+    // Final audit (17 Oct), Medium 1: the deepening keeper can be replaced by the platform (the Safe) only
+    function test_platform_replaces_the_deepening_keeper() public {
+        address oldKeeper = makeAddr("oldKeeper"); address newKeeper = makeAddr("newKeeper");
+        LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey, oldKeeper);
+        vm.prank(buyer); jig.transfer(address(deep), 1_000_000e18);
+        vm.prank(oldKeeper); vm.expectRevert(LPDeepening.NotPlatformAddr.selector); deep.setKeeper(newKeeper);
+        vm.prank(platform); deep.setKeeper(newKeeper);
+        vm.prank(oldKeeper); vm.expectRevert(LPDeepening.NotKeeper.selector); deep.run(1);
+        vm.prank(newKeeper); deep.run(1);
+        assertGt(deep.tokenId(), 0);
+    }
+
     function test_lp_deepening_adds_locked_liquidity() public {
         LPDeepening deep = new LPDeepening(address(hook), POSM, PERMIT2, jigKey, platform);
         // hand it JIG as if it were its slice
@@ -344,42 +374,43 @@ contract FlywheelsForkTest is Test {
 
     // ---------- SnapshotForwarder + HolderPayouts ----------
 
-    function test_snapshot_payouts_round_trip() public {
-        HolderPayouts payouts = new HolderPayouts(platform, address(jig));
-        SnapshotForwarder fwd = new SnapshotForwarder(address(hook), address(payouts), address(factory), address(nft));
-        vm.expectRevert(SnapshotForwarder.NoCoinYet.selector);
-        fwd.coin();
+    // fees to coin holders, on chain (Jj, 17 Oct): RewardsForwarder hands the slice to the coin, which streams it
+    function test_rewards_forwarder_streams_the_slice_to_holders() public {
+        RewardsForwarder fwd = new RewardsForwarder(address(hook), address(factory), address(nft));
+        vm.expectRevert(RewardsForwarder.NoCoinYet.selector);
+        fwd.rewardsCoin();
         (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(address(fwd));
-        assertEq(fwd.coin(), address(coin));
+        assertEq(address(fwd.rewardsCoin()), address(coin));
+        assertEq(coin.notifier(), address(fwd), "the factory made the flywheel the notifier");
         _buyCoin(key, coinIs0, 100_000e18);
         uint256 slice = hook.claimable(address(fwd));
         assertGt(slice, 0);
         fwd.pull();
-        assertEq(payouts.balance(address(coin)), slice, "slice delivered under this coin");
         assertEq(jig.balanceOf(address(fwd)), 0);
+        assertEq(jig.balanceOf(address(coin)), slice, "the slice sits in the coin, streaming");
+        vm.warp(block.timestamp + 7 days);
+        uint256 b = coin.earned(buyer); uint256 c = coin.earned(creator);
+        assertGt(b, 0);
+        assertLe(b + c, slice, "never more than the slice");
+        assertApproxEqRel(b + c, slice, 1e15, "all of it to the holders");
+        assertEq(coin.earned(POOL_MANAGER), 0, "the pool's coins earn nothing");
+        assertEq(coin.earned(address(airdrop)), 0, "nor does the airdrop's 5%");
+        vm.prank(buyer); coin.claim();
+        assertEq(jig.balanceOf(buyer) > 0, true);
+    }
 
-        // platform snapshots and declares a round: A 60%, B 40%
-        uint256 aAmt = slice * 60 / 100; uint256 bAmt = slice - aAmt;
-        bytes32 la = keccak256(bytes.concat(keccak256(abi.encode(holderA, aAmt))));
-        bytes32 lb = keccak256(bytes.concat(keccak256(abi.encode(holderB, bAmt))));
-        bytes32 root = la < lb ? keccak256(abi.encodePacked(la, lb)) : keccak256(abi.encodePacked(lb, la));
-        vm.prank(buyer);
-        vm.expectRevert();
-        payouts.declare(address(coin), root, slice, uint64(block.timestamp + 7 days));
-        vm.prank(platform);
-        uint256 round = payouts.declare(address(coin), root, slice, uint64(block.timestamp + 7 days));
-        assertEq(payouts.balance(address(coin)), 0);
-        bytes32[] memory pa = new bytes32[](1); pa[0] = lb;
-        payouts.claim(address(coin), round, holderA, aAmt, pa);
-        assertEq(jig.balanceOf(holderA), aAmt);
-        vm.expectRevert(HolderPayouts.AlreadyClaimed.selector);
-        payouts.claim(address(coin), round, holderA, aAmt, pa);
-        vm.expectRevert(HolderPayouts.NotExpired.selector);
-        payouts.settle(address(coin), round);
-        vm.warp(block.timestamp + 7 days + 1);
-        uint256 back = payouts.settle(address(coin), round);
-        assertEq(back, bAmt, "unclaimed returns to the coin's balance for the next round");
-        assertEq(payouts.balance(address(coin)), bAmt);
+    // review, 17 Oct: each pull restarts the 7-day stream for what is left, so pulls are limited to one a day; a griefer
+    // pulling after every trade could otherwise keep stretching holders' payouts
+    function test_rewards_forwarder_pulls_at_most_once_a_day() public {
+        RewardsForwarder fwd = new RewardsForwarder(address(hook), address(factory), address(nft));
+        (, PoolKey memory key, bool coinIs0) = _launchCoin(address(fwd));
+        _buyCoin(key, coinIs0, 100_000e18);
+        fwd.pull();
+        _buyCoin(key, coinIs0, 10_000e18);
+        vm.expectRevert(RewardsForwarder.TooSoon.selector);
+        fwd.pull();
+        vm.warp(block.timestamp + 1 days);
+        assertGt(fwd.pull(), 0, "a day later it pulls again");
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {

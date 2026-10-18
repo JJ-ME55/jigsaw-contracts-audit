@@ -253,9 +253,12 @@ contract CreatorCoinForkTest is Test {
     }
 
     function test_bad_fee_and_unregistered_pool_refused() public {
+        // a range on the correct side for whichever way the coin sorts against JIG (its CREATE2 address moves with
+        // the coin's bytecode), so the fee check is the one that refuses
+        bool c0 = factory.predictCoin(collection, "Cool", "COOL", bytes32(bytes20(collection))) < address(jig);
         vm.prank(creator);
         vm.expectRevert(CreatorFeeHook.BadFee.selector);
-        factory.launch{value: 0.01 ether}(_params(collection, 15_000, address(0), 1 << 96, -200, 0));
+        factory.launch{value: 0.01 ether}(_params(collection, 15_000, address(0), 1 << 96, c0 ? int24(200) : int24(-400), c0 ? int24(400) : int24(-200)));
     }
 
 

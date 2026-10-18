@@ -8,6 +8,8 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { CHAINS, isOurCollection } from './launch.mjs';
 import { send as sendTx } from './sender.mjs';
 import { DATA } from './store.mjs';
+import { leafOf, buildTree, proofFor, verify } from './merkle.mjs';
+export { leafOf, buildTree, proofFor, verify };
 import { ethPrice } from './builds.mjs';
 import { poolIdOf, readPool, priceOf } from './v4state.mjs';
 import * as vanity from './vanity.mjs';
@@ -24,7 +26,6 @@ export const addresses = () => ({
   feeHook: addr('CREATOR_FEE_HOOK'),
   factory: addr('COIN_FACTORY'),
   airdrop: addr('AIRDROP_CLAIM'),
-  payouts: addr('HOLDER_PAYOUTS'),
   deepening: addr('LP_DEEPENING'),
 });
 
@@ -52,43 +53,6 @@ const factoryAbi = parseAbi([
 const FILE = () => path.join(DATA, 'jig-allowlist.json');
 const readList = () => { try { return JSON.parse(fs.readFileSync(FILE(), 'utf8')); } catch { return { addresses: [], frozen: false, root: null }; } };
 const writeList = (l) => { fs.mkdirSync(DATA, { recursive: true }); fs.writeFileSync(FILE(), JSON.stringify(l, null, 1)); };
-
-export const leafOf = (address) => keccak256(keccak256(encodeAbiParameters([{ type: 'address' }], [getAddress(address)])));
-const pair = (a, b) => (a.toLowerCase() < b.toLowerCase() ? keccak256(concat([a, b])) : keccak256(concat([b, a])));
-
-export function buildTree(addresses) {
-  const leaves = [...new Set(addresses.map(getAddress))].map(leafOf).sort((a, b) => (a.toLowerCase() < b.toLowerCase() ? -1 : 1));
-  if (leaves.length === 0) return { root: null, layers: [] };
-  const layers = [leaves];
-  while (layers[layers.length - 1].length > 1) {
-    const prev = layers[layers.length - 1]; const next = [];
-    for (let i = 0; i < prev.length; i += 2) next.push(i + 1 < prev.length ? pair(prev[i], prev[i + 1]) : prev[i]);
-    layers.push(next);
-  }
-  return { root: layers[layers.length - 1][0], layers };
-}
-
-export function proofFor(addresses, address) {
-  if (!isAddress(address)) return { allowlisted: false, proof: [] };
-  const { layers } = buildTree(addresses);
-  if (!layers.length) return { allowlisted: false, proof: [] };
-  let idx = layers[0].indexOf(leafOf(address));
-  if (idx < 0) return { allowlisted: false, proof: [] };
-  const proof = [];
-  for (let l = 0; l < layers.length - 1; l++) {
-    const layer = layers[l]; const sib = idx ^ 1;
-    if (sib < layer.length) proof.push(layer[sib]);
-    idx = Math.floor(idx / 2);
-  }
-  return { allowlisted: true, proof };
-}
-
-// Pure-JS check that mirrors MerkleProof.verify, for tests and for the admin view.
-export function verify(root, address, proof) {
-  let h = leafOf(address);
-  for (const p of proof) h = pair(h, p);
-  return h === root;
-}
 
 export function allowlist() { const l = readList(); const { root } = buildTree(l.addresses); return { count: l.addresses.length, frozen: !!l.frozen, root, addresses: l.addresses }; }
 // The root on the hook, or null when none is set yet (or no hook is configured). On a mainnet DeployJIG sets the root,

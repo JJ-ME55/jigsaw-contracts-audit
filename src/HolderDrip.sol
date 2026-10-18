@@ -30,6 +30,7 @@ contract HolderDrip is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint256 private constant ACC = 1e18;
+    uint256 public constant MAX_FOLD = 64; // burns folded per pull: keeps every pull bounded (final audit, 17 Oct)
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     struct Checkpoint {
@@ -158,12 +159,16 @@ contract HolderDrip is ReentrancyGuard {
         emit MarkedBurned(tokenId, stranded);
     }
 
-    /// @dev Move burns that `supply` now covers into burnedCount. Bounded by tokens burned before their first pull.
+    /// @dev Move up to MAX_FOLD burns that `supply` now covers into burnedCount; the rest wait for later pulls. Until
+    ///      folded, a burned token still counts as live, which only lowers what each token is credited (owed() of a
+    ///      burned token is 0, so that share stays unclaimed): solvency is unaffected.
     function _foldBurns(uint256 supply) internal {
         uint256 n = _burnedAbove.length;
-        for (uint256 i; i < n;) {
+        uint256 folded;
+        for (uint256 i; i < n && folded < MAX_FOLD;) {
             if (_burnedAbove[i] <= supply) {
                 burnedCount++;
+                folded++;
                 _burnedAbove[i] = _burnedAbove[n - 1];
                 _burnedAbove.pop();
                 n--;

@@ -43,7 +43,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     uint256 public platformOwedEth; // team ETH whose push failed; withdrawn by the platform
     PoolKey public jigPool; // ETH / JIG
 
-    address public immutable keeper;
+    address public keeper; // the platform (the Safe) can replace it if the key is lost or leaks (final audit, 17 Oct)
 
     int24 public immutable tickLower;
     int24 public immutable tickUpper;
@@ -53,6 +53,7 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
 
     event Deepened(uint256 jigSold, uint256 ethGot, uint256 jigAdded, uint256 ethAdded, uint128 liquidity);
     event FeesCollected(uint256 eth, uint256 jig);
+    event KeeperSet(address keeper);
 
     error NotPoolManager();
     error ZeroAddress();
@@ -84,6 +85,14 @@ contract LPDeepening is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Pull the slice, sell half for ETH, add both to the locked full-range position. Keeper only.
+    /// @notice The platform (the Safe) replaces the keeper.
+    function setKeeper(address keeper_) external {
+        if (msg.sender != platform) revert NotPlatformAddr();
+        if (keeper_ == address(0)) revert ZeroAddress();
+        keeper = keeper_;
+        emit KeeperSet(keeper_);
+    }
+
     /// @param minEthOut the least ETH the keeper will accept for the half it sells (off-chain quote minus tolerance)
     function run(uint256 minEthOut) external nonReentrant {
         if (msg.sender != keeper) revert NotKeeper();

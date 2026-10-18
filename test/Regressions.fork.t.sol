@@ -165,6 +165,21 @@ contract RegressionsForkTest is Test {
         coinIs0;
     }
 
+    // Final audit (17 Oct), Medium 1: the keeper is a hot key; the platform (the Safe) can replace it, nobody else can
+    function test_platform_replaces_the_buyback_keeper_and_nobody_else_can() public {
+        _launchCoin(creator, address(0));
+        vm.warp(block.timestamp + 10 seconds);
+        address oldKeeper = makeAddr("oldKeeper"); address newKeeper = makeAddr("newKeeper");
+        BuybackAndBurn bb = new BuybackAndBurn(address(hook), address(factory), address(nft), oldKeeper);
+        vm.prank(buyer); jig.transfer(address(bb), 20_000e18);
+        vm.prank(oldKeeper); vm.expectRevert(BuybackAndBurn.NotPlatform.selector); bb.setKeeper(newKeeper);
+        vm.prank(buyer); vm.expectRevert(BuybackAndBurn.NotPlatform.selector); bb.setKeeper(newKeeper);
+        vm.prank(platform); bb.setKeeper(newKeeper);
+        assertEq(bb.keeper(), newKeeper);
+        vm.prank(oldKeeper); vm.expectRevert(BuybackAndBurn.NotKeeper.selector); bb.run(1);
+        vm.prank(newKeeper); assertGt(bb.run(1), 0);
+    }
+
     // MEDIUM: exact-output discount
     function test_exact_output_pays_the_same_rate() public {
         (CreatorCoin coin, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(0));
@@ -270,11 +285,12 @@ contract RegressionsForkTest is Test {
         AirdropClaim ac = new AirdropClaim(platform, address(pot));
         vm.expectRevert(AirdropClaim.NotFactory.selector);
         ac.notify(address(0x1234));
-        vm.prank(platform);
-        ac.setFactory(address(factory));
-        vm.prank(address(factory));
-        ac.notify(address(0x1234));
-        assertGt(ac.receivedAt(address(0x1234)), 0);
+        (CreatorCoin coin,,) = _launchCoin(creator, address(0));
+        vm.prank(buyer);
+        vm.expectRevert(AirdropClaim.NotFactory.selector);
+        airdrop.notify(address(coin));
+        (, uint64 opensAt,,) = airdrop.drops(address(coin));
+        assertGt(opensAt, 0, "the factory opened the drop at launch");
     }
 
 
@@ -359,21 +375,22 @@ contract RegressionsForkTest is Test {
     }
 
     // MEDIUM (third pass): a stale flywheel balance goes to the pot, never to the creator
-    function test_stale_flywheel_balance_feeds_the_pot_not_the_creator() public {
+    // ChatGPT review / Jj, 17 Oct: a flywheel's slice belongs to its holders (or its burn) and can be pulled by anyone, so it
+    // never expires: recycle() refuses it however long it sits, even if the keeper is down for weeks
+    function test_a_flywheel_balance_never_recycles() public {
         HolderDrip drip = new HolderDrip(address(hook), address(nft));
         (, PoolKey memory key, bool coinIs0) = _launchCoin(creator, address(drip));
         vm.warp(block.timestamp + 10 seconds);
         _swap(buyer, key, !coinIs0, -100_000e18, "");
         uint256 dripBal = hook.claimable(address(drip));
-        vm.prank(creator);
-        hook.setCreatorShare(key, 7000);
-        uint256 creatorBefore = hook.claimable(creator);
-        uint256 potBefore = hook.claimable(address(pot));
-        vm.warp(block.timestamp + 8 days);
+        assertGt(dripBal, 0);
+        vm.warp(block.timestamp + 60 days);
+        vm.expectRevert(CreatorFeeHook.NotStale.selector);
         hook.recycle(key, address(drip));
-        assertEq(hook.claimable(creator), creatorBefore, "creator gains nothing");
-        assertGt(hook.claimable(address(pot)) - potBefore, dripBal * 6000 / 10_000, "the block went to the pot");
-        assertEq(hook.claimable(address(drip)), 0);
+        (uint256 stale, uint256 fresh) = hook.recyclable(key, address(drip));
+        assertEq(stale, 0, "nothing of the flywheel is ever stale");
+        assertEq(fresh, dripBal);
+        assertEq(hook.claimable(address(drip)), dripBal, "still all there for the holders");
     }
 
     // HIGH (swarm audit): a dust JIG order on the empty side of the range must not capture the coin-side fee
@@ -501,14 +518,10 @@ contract RegressionsForkTest is Test {
         assertEq(hook.claimable(creator), freshCreator, "the fresh credit stays with the creator");
         assertGt(hook.claimable(fly), flyBefore, "the stale block fed the flywheel");
         // the block just moved to the flywheel is fresh: recycling the flywheel in the same block takes none of it
-        (uint256 flyStale,) = hook.recyclable(key, fly);
-        if (flyStale == 0) {
-            vm.expectRevert(CreatorFeeHook.NotStale.selector);
-            hook.recycle(key, fly);
-        } else {
-            uint256 g2 = hook.recycle(key, fly);
-            assertLe(g2, flyStale);
-        }
+        // and a flywheel's balance never recycles at all (17 Oct)
+        vm.warp(block.timestamp + 30 days);
+        vm.expectRevert(CreatorFeeHook.NotStale.selector);
+        hook.recycle(key, fly);
     }
 
     // LOW (swarm audit 4): a fee raised after the quote cannot take more than the creator agreed to

@@ -31,13 +31,15 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
     IPoolManager public immutable poolManager;
     CoinFactory public immutable factory;
     address public immutable collection;
-    address public immutable keeper;
+    address public keeper; // the platform (the Safe) can replace it if the key is lost or leaks (final audit, 17 Oct)
 
     uint256 public burned;
 
     event Burned(uint256 jigSpent, uint256 coinBurned);
+    event KeeperSet(address keeper);
 
     error NotKeeper();
+    error NotPlatform();
     error NotPoolManager();
     error ZeroAddress();
     error Nothing();
@@ -52,6 +54,14 @@ contract BuybackAndBurn is IUnlockCallback, ReentrancyGuard {
         factory = CoinFactory(factory_);
         collection = collection_;
         keeper = keeper_;
+    }
+
+    /// @notice The platform (CreatorFeeHook.platform(), the Safe) replaces the keeper.
+    function setKeeper(address keeper_) external {
+        if (msg.sender != hook.platform()) revert NotPlatform();
+        if (keeper_ == address(0)) revert ZeroAddress();
+        keeper = keeper_;
+        emit KeeperSet(keeper_);
     }
 
     /// @notice The coin and pool this module serves, read from the factory.
