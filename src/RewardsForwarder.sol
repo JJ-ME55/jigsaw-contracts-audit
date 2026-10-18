@@ -65,7 +65,8 @@ contract RewardsForwarder is ReentrancyGuard {
             c.notifyReward(amount);
         } else {
             address a = factory.coinOf(collection);
-            if (a != address(0) && CreatorCoin(a).carry() > 0 && !CreatorCoin(a).rewardsPaused()) CreatorCoin(a).notifyReward(0);
+            // only a carry that can stream at least 1 wei a second; division dust (< DURATION wei) waits (round 9, Info 6)
+            if (a != address(0) && CreatorCoin(a).carry() >= CreatorCoin(a).DURATION() && !CreatorCoin(a).rewardsPaused()) CreatorCoin(a).notifyReward(0);
         }
         emit Forwarded(amount);
     }

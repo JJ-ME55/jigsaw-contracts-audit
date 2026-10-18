@@ -161,9 +161,12 @@ export async function plan() {
       coins += 1;
       // push airdrop: a batch of minted, unclaimed, unburned ids per pass, while the 30-day window is open. Done for good
       // once the window closes, or once the collection is complete and every id is pushed or claimed.
-      if (a.airdrop && !st.airdropDone?.[coin]) await guard(`airdrop:${coin}`, async () => {
+      if (a.airdrop && !st.airdropDone?.[coin] && !(Date.now() < (st.airdropRecheckAt?.[coin] ?? 0))) await guard(`airdrop:${coin}`, async () => {
         const pa = await rewards.pushableIds(coin);
-        if (!pa.open || (pa.complete && pa.ids.length === 0)) { (st.airdropDone ??= {})[coin] = true; return; }
+        // done only when nothing is left anywhere: an NFT in an escrow or vault now may come back to a wallet later in
+        // the window (round 9, Low 3); while only those (or unreadable owners) remain, look again hourly, not every pass
+        if (!pa.open || (pa.complete && pa.ids.length === 0 && !pa.contractHeld?.length && !pa.unknown?.length)) { (st.airdropDone ??= {})[coin] = true; return; }
+        if (pa.ids.length === 0) { (st.airdropRecheckAt ??= {})[coin] = Date.now() + 3600_000; return; }
         if (!pa.ids.length) return; // more NFTs may still be minted
         const batch = pa.ids.slice(0, env('KEEPER_AIRDROP_BATCH', 15));
         // Pay-as-earned (Jj + Fish, 17 Oct: no launch fee): a batch goes out only while the platform's share of this
@@ -216,7 +219,7 @@ export async function plan() {
       }
     });
   }
-  writeState({ ...readState(), kinds: st.kinds, airdropDone: st.airdropDone, fees: st.fees, prices: st.prices });
+  writeState({ ...readState(), kinds: st.kinds, airdropDone: st.airdropDone, airdropRecheckAt: st.airdropRecheckAt, fees: st.fees, prices: st.prices });
   return { chainId: a.chainId, keeper: account.address, jigUsd: jp?.jigUsd ?? null, coins, jobs };
 }
 

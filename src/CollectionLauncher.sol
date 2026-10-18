@@ -70,6 +70,7 @@ contract CollectionLauncher {
         if (msg.sender != operator) revert NotOperator();
         if (provenance == bytes32(0)) revert BadProvenance(); // LoomCollection would treat a zero hash as committed forever
         if (freeze && revealLater) revert NothingToFreeze(); // the reveal freezes it; as JigsawCollection (swarm round 8, Info 7)
+        if (freeze && bytes(uri).length == 0) revert NothingToFreeze(); // never frozen on no metadata (round 9, Low 2)
         collection = factory.createCollection{value: msg.value}(
             c.name, c.symbol, c.maxSupply, c.mintPriceWei, c.maxPerWallet, c.creator, c.royaltyBps
         );

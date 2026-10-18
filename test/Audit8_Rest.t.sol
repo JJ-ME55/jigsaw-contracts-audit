@@ -109,3 +109,28 @@ contract Audit8RestTest is Test {
     // platform() for CreatorCoin's pause check (this contract is the coin's factory)
     function platform() external view returns (address) { return safe; }
 }
+
+/// Swarm audit round 9, Info 6: a pull with no new JIG re-streams the carry only when it can pay at least 1 wei a
+/// second; division dust (< DURATION wei) stays as carry and the running stream's schedule is left alone.
+contract Audit9DustTest is Test {
+    function platform() external pure returns (address) { return address(0xBEEF); }
+
+    function test_info6_dust_carry_does_not_restart_the_stream() public {
+        vm.warp(1_800_000_000);
+        A8Jig jig = new A8Jig();
+        A8HookFactory hf = new A8HookFactory(address(jig));
+        RewardsForwarder fwd = new RewardsForwarder(address(hf), address(hf), makeAddr("collection"));
+        CreatorCoin coin = new CreatorCoin("C", "C", 1_000e18, makeAddr("collection"), address(this), address(jig), new address[](0));
+        coin.setNotifier(address(fwd));
+        hf.setCoin(address(coin));
+        coin.transfer(makeAddr("alice"), 100e18);
+        jig.mint(address(fwd), 1_000e18 + 12_345);
+        fwd.pull();
+        assertGt(coin.carry(), 0, "division dust");
+        assertLt(coin.carry(), 1 days, "only dust");
+        uint256 finish = coin.periodFinish();
+        vm.warp(1_800_000_000 + 1 days);
+        fwd.pull(); // no new JIG, only dust: nothing to re-stream
+        assertEq(coin.periodFinish(), finish, "stream schedule untouched");
+    }
+}

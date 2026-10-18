@@ -69,7 +69,7 @@ export async function airdropFor(coin, account) {
   const ids = mine.filter((_, k) => !claimed[k]);
   // delivery status for the whole collection's pending shares (what the keeper still has to push)
   let delivery = null;
-  try { const pa = await pushableIds(coin); delivery = open ? await pushStatus(coin, collection, pa.ids.length) : { status: 'closed' }; } catch (e) { delivery = { status: 'unknown', reason: e.shortMessage ?? e.message }; }
+  try { const pa = await pushableCached(coin); delivery = open ? await pushStatus(coin, collection, pa.ids.length) : { status: 'closed' }; } catch (e) { delivery = { status: 'unknown', reason: e.shortMessage ?? e.message }; }
   // a contract wallet (Safe, smart account) is never pushed to (round 8, Medium 2): it claims with the button
   const selfClaim = ((await p.getCode({ address: account }).catch(() => '0x')) ?? '0x') !== '0x';
   return {
@@ -81,23 +81,46 @@ export async function airdropFor(coin, account) {
 
 /** For the keeper's push airdrop: ids of `coin`'s drop that are minted, unclaimed and not burned, plus whether the
  *  collection is complete (every id minted), so the keeper knows when nothing more can ever become pushable. */
-export async function pushableIds(coin) {
+// Whether an owner is a contract (claimFor skips those), cached an hour; a failed read is not cached and counts as
+// unknown, never as a wallet (round 9, Info 5). Reads run 25 at a time, not one after another (round 9, Low 4).
+const _code = new Map();
+export async function codeOf(p, owners) {   // exported for tests
+  const out = new Map(); const todo = [];
+  for (const o of owners) { const c = _code.get(o); if (c && Date.now() - c.at < 3600_000) out.set(o, c.has); else todo.push(o); }
+  for (let i = 0; i < todo.length; i += 25) {
+    await Promise.all(todo.slice(i, i + 25).map(async (o) => {
+      try { const has = ((await p.getCode({ address: o })) ?? '0x') !== '0x'; _code.set(o, { has, at: Date.now() }); out.set(o, has); }
+      catch { out.set(o, null); }
+    }));
+  }
+  return out;
+}
+// The site's airdrop view reads the delivery status from a copy at most a minute old (round 9, Low 4); the keeper
+// always reads fresh.
+const _push = new Map();
+async function pushableCached(coin) {
+  const k = String(coin).toLowerCase(); const hit = _push.get(k);
+  if (hit && Date.now() - hit.at < 60_000) return hit.p;
+  const p = pushableIds(coin, { fresh: false }).catch((e) => { _push.delete(k); throw e; });
+  _push.set(k, { at: Date.now(), p }); return p;
+}
+
+export async function pushableIds(coin, { fresh = true } = {}) {
   coin = addr(coin, 'coin'); const a = addresses(); if (!a.airdrop) return { open: false, ids: [] };
   const p = pub();
   const [collection, opensAt, perNft, maxId] = await p.readContract({ address: a.airdrop, abi: airdropAbi, functionName: 'drops', args: [coin] });
   if (!Number(opensAt) || perNft === 0n) return { open: false, ids: [] };
   const window = Number(await p.readContract({ address: a.airdrop, abi: airdropAbi, functionName: 'CLAIM_WINDOW' }));
   if (Math.floor(Date.now() / 1000) > Number(opensAt) + window) return { open: false, ids: [] };
-  _owners.delete(collection); // fresh owners: a push goes to whoever holds the NFT now
+  if (fresh) _owners.delete(collection); // the keeper's push goes to whoever holds the NFT now
   const owners = await ownersOf(p, collection, maxId);
   const minted = []; for (let id = 1; id < owners.length; id++) if (owners[id] && owners[id] !== getAddress('0x000000000000000000000000000000000000dEaD')) minted.push(id);
   const claimed = minted.length ? await p.multicall({ multicallAddress: MULTICALL3, allowFailure: false, contracts: minted.map((id) => ({ address: a.airdrop, abi: airdropAbi, functionName: 'claimed', args: [coin, BigInt(id)] })) }) : [];
   const open = minted.filter((_, k) => !claimed[k]);
   // claimFor skips NFTs held by a contract (escrow, vault, smart wallet: swarm round 8, Medium 2); their owners claim
   // themselves, so the keeper never queues them (it would send the same batch again and again)
-  const code = new Map();
-  for (const o of new Set(open.map((id) => owners[id]))) code.set(o, ((await p.getCode({ address: o }).catch(() => '0x')) ?? '0x') !== '0x');
-  return { open: true, collection, ids: open.filter((id) => !code.get(owners[id])), contractHeld: open.filter((id) => code.get(owners[id])), complete: owners.length - 1 >= Number(maxId), airdrop: a.airdrop };
+  const code = await codeOf(p, new Set(open.map((id) => owners[id])));
+  return { open: true, collection, ids: open.filter((id) => code.get(owners[id]) === false), contractHeld: open.filter((id) => code.get(owners[id]) === true), unknown: open.filter((id) => code.get(owners[id]) === null), complete: owners.length - 1 >= Number(maxId), airdrop: a.airdrop };
 }
 
 // ---------------- what the platform has earned from one coin (for the airdrop push gate) ----------------

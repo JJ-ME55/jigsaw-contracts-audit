@@ -243,12 +243,14 @@ contract CoinFactory is IUnlockCallback, ReentrancyGuard {
 
     /// @dev Protocol addresses that hold coin but are not holders: no share of holder rewards (CreatorCoin).
     function _excluded() internal view returns (address[] memory e) {
-        e = new address[](4);
+        // the pot receives every swept airdrop remainder and has no way to call claim() (swarm round 8, High 1); only an
+        // AirdropClaim recipient has one: a plain wallet recipient has no code to ask (round 9, Low 1)
+        bool hasPot = airdropRecipient.code.length != 0;
+        e = new address[](hasPot ? 4 : 3);
         e[0] = address(poolManager);
         e[1] = address(hook);
         e[2] = airdropRecipient;
-        // the pot receives every swept airdrop remainder and has no way to call claim() (swarm round 8, High 1)
-        e[3] = IAirdropPot(airdropRecipient).pot();
+        if (hasPot) e[3] = IAirdropPot(airdropRecipient).pot();
     }
 
     function count() external view returns (uint256) {
